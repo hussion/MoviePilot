@@ -9,8 +9,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - run: gh repo sync $REPOSITORY -b $BRANCH_NAME && git remote add upstream $REPOSITORY && git fetch --tags upstream && git push --tags
+      - run: gh repo sync $REPOSITORY -b $BRANCH_NAME && git remote add upstream $REMOTE_REPO && git fetch --tags upstream && git push --tags
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           BRANCH_NAME: ${{ github.ref_name }}
+          REMOTE_REPO: 'git@github.com:jxxghp/MoviePilot.git'
