@@ -40,13 +40,7 @@ class SiteChain(ChainBase):
         self.rsshelper = RssHelper()
         self.cookiehelper = CookieHelper()
         self.message = MessageHelper()
-        self.cookiecloud = CookieCloudHelper(
-            server=settings.COOKIECLOUD_HOST,
-            key=settings.COOKIECLOUD_KEY,
-            password=settings.COOKIECLOUD_PASSWORD,
-            enable_local=settings.COOKIECLOUD_ENABLE_LOCAL,
-            local_path=settings.COOKIE_PATH
-        )
+        self.cookiecloud = CookieCloudHelper()
 
         # 特殊站点登录验证
         self.special_site_test = {
