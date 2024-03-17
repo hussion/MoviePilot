@@ -37,14 +37,7 @@ _doh_resolvers = [
     "1.1.1.1",
     # https://support.quad9.net/hc/en-us
     "9.9.9.9",
-    "149.112.112.112",
-    # https://support.opendns.com/hc/en-us
-    "208.67.220.220",
-    "208.67.222.222",
-    # https://developers.google.com/speed/public-dns/docs/doh
-    "dns.google",
-    # https://adguard-dns.io/public-dns.html
-    "dns.adguard-dns.com",
+    "149.112.112.112"
 ]
 
 
@@ -139,7 +132,7 @@ def _doh_query(resolver: str, host: str) -> Optional[str]:
         return None
 
 
-def _doh_query_json(resolver: str, host: str) -> Optional[str]:
+def doh_query_json(resolver: str, host: str) -> Optional[str]:
     """
     使用给定的DoH解析器查询给定主机的IP地址。
     """
