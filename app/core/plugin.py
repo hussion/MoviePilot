@@ -1,5 +1,7 @@
+import concurrent
+import concurrent.futures
 import traceback
-from typing import List, Any, Dict, Tuple
+from typing import List, Any, Dict, Tuple, Optional
 
 from app.core.config import settings
 from app.core.event import eventmanager
@@ -117,13 +119,13 @@ class PluginManager(metaclass=Singleton):
         """
         if SystemUtils.is_frozen():
             return
-        logger.info("开始安装在线插件...")
+        logger.info("开始安装第三方插件...")
         # 已安装插件
         install_plugins = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins) or []
         # 在线插件
         online_plugins = self.get_online_plugins()
         if not online_plugins:
-            logger.error("未获取到在线插件")
+            logger.error("未获取到第三方插件")
             return
         # 支持更新的插件自动更新
         for plugin in online_plugins:
@@ -138,7 +140,7 @@ class PluginManager(metaclass=Singleton):
                         f"插件 {plugin.get('plugin_name')} v{plugin.get('plugin_version')} 安装失败：{msg}")
                     continue
                 logger.info(f"插件 {plugin.get('plugin_name')} 安装成功，版本：{plugin.get('plugin_version')}")
-        logger.info("在线插件安装完成")
+        logger.info("第三方插件安装完成")
 
     def get_plugin_config(self, pid: str) -> dict:
         """
@@ -282,18 +284,15 @@ class PluginManager(metaclass=Singleton):
         """
         获取所有在线插件信息
         """
-        # 返回值
-        all_confs = []
-        if not settings.PLUGIN_MARKET:
-            return all_confs
-        # 已安装插件
-        installed_apps = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins) or []
-        # 线上插件列表
-        markets = settings.PLUGIN_MARKET.split(",")
-        for market in markets:
+        def __get_plugin_info(market: str) -> Optional[dict]:
+            """
+            获取插件信息
+            """
             online_plugins = self.pluginhelper.get_plugins(market) or {}
             if not online_plugins:
-                logger.warn(f"获取插件库失败 {market}")
+                logger.warn(f"获取插件库失败：{market}")
+                return
+            ret_plugins = []
             for pid, plugin in online_plugins.items():
                 # 运行状插件
                 plugin_obj = self._running_plugins.get(pid)
@@ -355,11 +354,27 @@ class PluginManager(metaclass=Singleton):
                 # 本地标志
                 conf.update({"is_local": False})
                 # 汇总
-                all_confs.append(conf)
+                ret_plugins.append(conf)
+            return ret_plugins
+
+        if not settings.PLUGIN_MARKET:
+            return []
+        # 返回值
+        all_plugins = []
+        # 已安装插件
+        installed_apps = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins) or []
+        # 使用多线程获取线上插件
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
+            for m in settings.PLUGIN_MARKET.split(","):
+                futures.append(executor.submit(__get_plugin_info, m))
+            for future in concurrent.futures.as_completed(futures):
+                plugins = future.result()
+                if plugins:
+                    all_plugins.extend(plugins)
+        logger.info(f"共获取到 {len(all_plugins)} 个第三方插件")
         # 按插件ID去重
-        if all_confs:
-            all_confs = list({v["id"]: v for v in all_confs}.values())
-        return all_confs
+        return list({v["id"]: v for v in all_plugins}.values())
 
     def get_local_plugins(self) -> List[dict]:
         """
