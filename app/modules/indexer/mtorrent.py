@@ -30,9 +30,9 @@ class MTorrentSpider:
 
     # 标签
     _labels = {
-        0: "",
-        4: "中字",
-        6: "国配",
+        "0": "",
+        "4": "中字",
+        "6": "国配",
     }
 
     def __init__(self, indexer: CommentedMap):
@@ -47,6 +47,9 @@ class MTorrentSpider:
             self._ua = indexer.get('ua')
 
     def search(self, keyword: str, mtype: MediaType = None, page: int = 0) -> Tuple[bool, List[dict]]:
+        """
+        搜索
+        """
         if not mtype:
             categories = []
         elif mtype == MediaType.TV:
@@ -74,6 +77,14 @@ class MTorrentSpider:
         if res and res.status_code == 200:
             results = res.json().get('data', {}).get("data") or []
             for result in results:
+                category_value = result.get('category')
+                if category_value in self._tv_category \
+                        and category_value not in self._movie_category:
+                    category = MediaType.TV.value
+                elif category_value in self._movie_category:
+                    category = MediaType.MOVIE.value
+                else:
+                    category = MediaType.UNKNOWN.value
                 torrent = {
                     'title': result.get('name'),
                     'description': result.get('smallDescr'),
@@ -87,7 +98,9 @@ class MTorrentSpider:
                     'uploadvolumefactor': self.__get_uploadvolumefactor(result.get('status', {}).get("discount")),
                     'page_url': self._pageurl % (self._domain, result.get('id')),
                     'imdbid': self.__find_imdbid(result.get('imdb')),
-                    'labels': [self._labels.get(result.get('labels') or 0)] if result.get('labels') else []
+                    'labels': [self._labels.get(result.get('labels'))] if result.get('labels') and result.get(
+                        'labels') != "0" else [],
+                    'category': category
                 }
                 torrents.append(torrent)
         elif res is not None:
@@ -100,6 +113,9 @@ class MTorrentSpider:
 
     @staticmethod
     def __find_imdbid(imdb: str) -> str:
+        """
+        从imdb链接中提取imdbid
+        """
         if imdb:
             m = re.search(r"tt\d+", imdb)
             if m:
@@ -108,6 +124,9 @@ class MTorrentSpider:
 
     @staticmethod
     def __get_downloadvolumefactor(discount: str) -> float:
+        """
+        获取下载系数
+        """
         discount_dict = {
             "FREE": 0,
             "PERCENT_50": 0.5,
@@ -121,6 +140,9 @@ class MTorrentSpider:
 
     @staticmethod
     def __get_uploadvolumefactor(discount: str) -> float:
+        """
+        获取上传系数
+        """
         uploadvolumefactor_dict = {
             "_2X": 2.0,
             "_2X_FREE": 2.0,
@@ -131,6 +153,9 @@ class MTorrentSpider:
         return 1
 
     def __get_download_url(self, torrent_id: str) -> str:
+        """
+        获取下载链接，返回base64编码的json字符串及URL
+        """
         url = self._downloadurl % self._domain
         params = {
             'method': 'post',
