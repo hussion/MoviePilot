@@ -31,8 +31,13 @@ class MTorrentSpider:
     # 标签
     _labels = {
         "0": "",
+        "1": "DIY",
+        "2": "国配",
+        "3": "DIY 国配",
         "4": "中字",
-        "6": "国配",
+        "5": "DIY 中字",
+        "6": "国配 中字",
+        "7": "DIY 国配 中字"
     }
 
     def __init__(self, indexer: CommentedMap):
@@ -85,6 +90,11 @@ class MTorrentSpider:
                     category = MediaType.MOVIE.value
                 else:
                     category = MediaType.UNKNOWN.value
+                labels_value = self._labels.get(result.get('labels') or "0") or ""
+                if labels_value:
+                    labels = labels_value.split()
+                else:
+                    labels = []
                 torrent = {
                     'title': result.get('name'),
                     'description': result.get('smallDescr'),
@@ -98,8 +108,7 @@ class MTorrentSpider:
                     'uploadvolumefactor': self.__get_uploadvolumefactor(result.get('status', {}).get("discount")),
                     'page_url': self._pageurl % (self._domain, result.get('id')),
                     'imdbid': self.__find_imdbid(result.get('imdb')),
-                    'labels': [self._labels.get(result.get('labels'))] if result.get('labels') and result.get(
-                        'labels') != "0" else [],
+                    'labels': labels,
                     'category': category
                 }
                 torrents.append(torrent)
