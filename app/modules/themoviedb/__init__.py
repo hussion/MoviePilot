@@ -262,11 +262,12 @@ class TheMovieDbModule(_ModuleBase):
         return []
 
     def scrape_metadata(self, path: Path, mediainfo: MediaInfo, transfer_type: str,
-                        force_nfo: bool = False, force_img: bool = False) -> None:
+                        metainfo: MetaBase = None, force_nfo: bool = False, force_img: bool = False) -> None:
         """
         刮削元数据
         :param path: 媒体文件路径
         :param mediainfo:  识别的媒体信息
+        :param metainfo: 源文件的识别元数据
         :param transfer_type:  转移类型
         :param force_nfo:  强制刮削nfo
         :param force_img:  强制刮削图片
@@ -282,6 +283,7 @@ class TheMovieDbModule(_ModuleBase):
             self.scraper.gen_scraper_files(mediainfo=mediainfo,
                                            file_path=scrape_path,
                                            transfer_type=transfer_type,
+                                           metainfo=metainfo,
                                            force_nfo=force_nfo,
                                            force_img=force_img)
         elif path.is_file():
@@ -290,6 +292,7 @@ class TheMovieDbModule(_ModuleBase):
             self.scraper.gen_scraper_files(mediainfo=mediainfo,
                                            file_path=path,
                                            transfer_type=transfer_type,
+                                           metainfo=metainfo,
                                            force_nfo=force_nfo,
                                            force_img=force_img)
         else:
