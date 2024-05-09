@@ -333,6 +333,8 @@ class PluginManager(metaclass=Singleton):
             if hasattr(plugin, "get_dashboard") \
                     and ObjectUtils.check_method(plugin.get_dashboard):
                 try:
+                    if not plugin.get_state():
+                        continue
                     dashboards.append({
                         "id": pid,
                         "name": plugin.plugin_name
