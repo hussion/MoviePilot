@@ -82,7 +82,8 @@ class FileTransferModule(_ModuleBase):
 
     def transfer(self, path: Path, meta: MetaBase, mediainfo: MediaInfo,
                  transfer_type: str, target: Path = None,
-                 episodes_info: List[TmdbEpisode] = None) -> TransferInfo:
+                 episodes_info: List[TmdbEpisode] = None,
+                 scrape: bool = None) -> TransferInfo:
         """
         文件转移
         :param path:  文件路径
@@ -91,6 +92,7 @@ class FileTransferModule(_ModuleBase):
         :param transfer_type:  转移方式
         :param target:  目标路径
         :param episodes_info: 当前季的全部集信息
+        :param scrape: 是否刮削元数据
         :return: {path, target_path, message}
         """
         # 获取目标路径
@@ -103,7 +105,10 @@ class FileTransferModule(_ModuleBase):
                                     path=path,
                                     message="未找到有效的媒体库目录")
             # 拼装媒体库一、二级子目录
-            need_scrape = dir_info.scrape
+            if scrape is None:
+                need_scrape = dir_info.scrape
+            else:
+                need_scrape = scrape
             target = self.__get_dest_dir(mediainfo=mediainfo, target_dir=dir_info)
         else:
             # 指定了目的目录
@@ -403,10 +408,20 @@ class FileTransferModule(_ModuleBase):
         :target_dir: 媒体库根目录
         :typename_dir: 是否加上类型目录
         """
-        if target_dir.auto_category or target_dir.category:
-            return Path(target_dir.path) / mediainfo.category
+        if not target_dir.media_type and target_dir.auto_category:
+            # 一级自动分类
+            download_dir = Path(target_dir.path) / mediainfo.type.value
+        elif target_dir.media_type:
+            # 一级自定义分类
+            download_dir = Path(target_dir.path) / target_dir.media_type
         else:
-            return Path(target_dir.path)
+            download_dir = Path(target_dir.path)
+
+        if (target_dir.category or target_dir.auto_category) and mediainfo.category:
+            # 二级自动分类
+            download_dir = download_dir / mediainfo.category
+
+        return download_dir
 
     def transfer_media(self,
                        in_path: Path,
