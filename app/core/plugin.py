@@ -1,11 +1,11 @@
 import concurrent
 import concurrent.futures
 import inspect
-import os
 import threading
 import time
 import traceback
-from typing import List, Any, Dict, Tuple, Optional, Callable
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -13,6 +13,7 @@ from watchdog.observers import Observer
 from app import schemas
 from app.core.config import settings
 from app.core.event import eventmanager
+from app.db.plugindata_oper import PluginDataOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.helper.module import ModuleHelper
 from app.helper.plugin import PluginHelper
@@ -26,7 +27,6 @@ from app.utils.system import SystemUtils
 
 
 class PluginMonitorHandler(FileSystemEventHandler):
-
     # 计时器
     __reload_timer = None
     # 防抖时间间隔
@@ -42,21 +42,35 @@ class PluginMonitorHandler(FileSystemEventHandler):
         """
         if event.is_directory:
             return
+        # 使用 pathlib 处理文件路径，跳过非 .py 文件以及 pycache 目录中的文件
+        event_path = Path(event.src_path)
+        if not event_path.name.endswith(".py") or "pycache" in event_path.parts:
+            return
+
         current_time = time.time()
         if current_time - self.__last_modified < self.__timeout:
             return
         self.__last_modified = current_time
         # 读取插件根目录下的__init__.py文件，读取class XXXX(_PluginBase)的类名
         try:
-            # 使用os.path和pathlib处理跨平台的路径问题
-            plugin_dir = event.src_path.split("plugins" + os.sep)[1].split(os.sep)[0]
-            init_file = settings.ROOT_PATH / "app" / "plugins" / plugin_dir / "__init__.py"
+            plugins_root = settings.ROOT_PATH / "app" / "plugins"
+            # 确保修改的文件在 plugins 目录下
+            if plugins_root not in event_path.parents:
+                return
+            # 获取插件目录路径，没有找到__init__.py时，说明不是有效包，跳过插件重载
+            # 插件重载目前没有支持app/plugins/plugin/package/__init__.py的场景，这里也不做支持
+            plugin_dir = event_path.parent
+            init_file = plugin_dir / "__init__.py"
+            if not init_file.exists():
+                logger.debug(f"{plugin_dir} 下没有找到 __init__.py，跳过插件重载")
+                return
+
             with open(init_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             pid = None
             for line in lines:
                 if line.startswith("class") and "(_PluginBase)" in line:
-                    pid = line.split("class ")[1].split("(_PluginBase)")[0]
+                    pid = line.split("class ")[1].split("(_PluginBase)")[0].strip()
             if pid:
                 # 防抖处理，通过计时器延迟加载
                 if self.__reload_timer:
@@ -97,6 +111,7 @@ class PluginManager(metaclass=Singleton):
         self.siteshelper = SitesHelper()
         self.pluginhelper = PluginHelper()
         self.systemconfig = SystemConfigOper()
+        self.plugindata = PluginDataOper()
         # 开发者模式监测插件修改
         if settings.DEV or settings.PLUGIN_AUTO_RELOAD:
             self.__start_monitor()
@@ -320,6 +335,16 @@ class PluginManager(metaclass=Singleton):
             return False
         return self.systemconfig.delete(self._config_key % pid)
 
+    def delete_plugin_data(self, pid: str) -> bool:
+        """
+        删除插件数据
+        :param pid: 插件ID
+        """
+        if not self._plugins.get(pid):
+            return False
+        self.plugindata.del_data(pid)
+        return True
+
     def get_plugin_form(self, pid: str) -> Tuple[List[dict], Dict[str, Any]]:
         """
         获取插件表单
@@ -350,6 +375,7 @@ class PluginManager(metaclass=Singleton):
         :param pid: 插件ID
         :param key: 仪表盘key
         """
+
         def __get_params_count(func: Callable):
             """
             获取函数的参数信息
@@ -619,24 +645,27 @@ class PluginManager(metaclass=Singleton):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             for m in settings.PLUGIN_MARKET.split(","):
+                if not m:
+                    continue
                 futures.append(executor.submit(__get_plugin_info, m))
             for future in concurrent.futures.as_completed(futures):
                 plugins = future.result()
                 if plugins:
                     all_plugins.extend(plugins)
+        # 去重
+        all_plugins = list({f"{p.id}{p.plugin_version}": p for p in all_plugins}.values())
         # 所有插件按repo在设置中的顺序排序
         all_plugins.sort(
             key=lambda x: settings.PLUGIN_MARKET.split(",").index(x.repo_url) if x.repo_url else 0
         )
-        # 按插件ID和版本号去重，相同插件以前面的为准
-        result = []
-        _dup = []
+        # 相同ID的插件保留版本号最大版本
+        max_versions = {}
         for p in all_plugins:
-            key = f"{p.id}v{p.plugin_version}"
-            if key not in _dup:
-                _dup.append(key)
-                result.append(p)
-        logger.info(f"共获取到 {len(result)} 个第三方插件")
+            if p.id not in max_versions or StringUtils.compare_version(p.plugin_version, max_versions[p.id]) > 0:
+                max_versions[p.id] = p.plugin_version
+        result = [p for p in all_plugins if
+                  p.plugin_version == max_versions[p.id]]
+        logger.info(f"共获取到 {len(result)} 个线上插件")
         return result
 
     def get_local_plugins(self) -> List[schemas.Plugin]:

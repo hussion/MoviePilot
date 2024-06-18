@@ -2,7 +2,7 @@ import secrets
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseSettings, validator
 
@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     """
     # 项目名称
     PROJECT_NAME = "MoviePilot"
+    # 域名 格式；https://movie-pilot.org
+    APP_DOMAIN: str = ""
     # API路径
     API_V1_STR: str = "/api/v1"
     # 前端资源路径
@@ -93,8 +95,8 @@ class Settings(BaseSettings):
     AUTH_SITE: str = ""
     # 交互搜索自动下载用户ID，使用,分割
     AUTO_DOWNLOAD_USER: Optional[str] = None
-    # 消息通知渠道 telegram/wechat/slack/synologychat/vocechat，多个通知渠道用,分隔
-    MESSAGER: str = "telegram"
+    # 消息通知渠道 telegram/wechat/slack/synologychat/vocechat/webpush，多个通知渠道用,分隔
+    MESSAGER: str = "webpush"
     # WeChat企业ID
     WECHAT_CORPID: Optional[str] = None
     # WeChat应用Secret
@@ -197,6 +199,8 @@ class Settings(BaseSettings):
     COOKIECLOUD_PASSWORD: Optional[str] = None
     # CookieCloud同步间隔（分钟）
     COOKIECLOUD_INTERVAL: Optional[int] = 60 * 24
+    # CookieCloud同步黑名单，多个域名,分割
+    COOKIECLOUD_BLACKLIST: Optional[str] = None
     # OCR服务器地址
     OCR_HOST: str = "https://movie-pilot.org"
     # CookieCloud对应的浏览器UA
@@ -220,6 +224,8 @@ class Settings(BaseSettings):
     PLUGIN_MARKET: str = "https://github.com/jxxghp/MoviePilot-Plugins,https://github.com/thsrite/MoviePilot-Plugins,https://github.com/honue/MoviePilot-Plugins,https://github.com/InfinityPacer/MoviePilot-Plugins"
     # Github token，提高请求api限流阈值 ghp_****
     GITHUB_TOKEN: Optional[str] = None
+    # Github代理服务器，格式：https://mirror.ghproxy.com/
+    GITHUB_PROXY: Optional[str] = ''
     # 自动检查和更新站点资源包（站点索引、认证等）
     AUTO_UPDATE_RESOURCE: bool = True
     # 元数据识别缓存过期时间（小时）
@@ -300,7 +306,7 @@ class Settings(BaseSettings):
     @property
     def LOG_PATH(self):
         return self.CONFIG_PATH / "logs"
-    
+
     @property
     def COOKIE_PATH(self):
         return self.CONFIG_PATH / "cookies"
@@ -359,7 +365,7 @@ class Settings(BaseSettings):
         """
         if not self.DOWNLOADER:
             return None
-        return self.DOWNLOADER.split(",")[0]
+        return next((d for d in settings.DOWNLOADER.split(",") if d), None)
 
     @property
     def DOWNLOADERS(self):
@@ -368,7 +374,25 @@ class Settings(BaseSettings):
         """
         if not self.DOWNLOADER:
             return []
-        return self.DOWNLOADER.split(",")
+        return [d for d in settings.DOWNLOADER.split(",") if d]
+
+    @property
+    def VAPID(self):
+        return {
+            "subject": f"mailto:{self.SUPERUSER}@movie-pilot.org",
+            "publicKey": "BH3w49sZA6jXUnE-yt4jO6VKh73lsdsvwoJ6Hx7fmPIDKoqGiUl2GEoZzy-iJfn4SfQQcx7yQdHf9RknwrL_lSM",
+            "privateKey": "JTixnYY0vEw97t9uukfO3UWKfHKJdT5kCQDiv3gu894"
+        }
+
+    def MP_DOMAIN(self, url: str = None):
+        if not self.APP_DOMAIN:
+            return None
+        domain = self.APP_DOMAIN.rstrip("/")
+        if not domain.startswith("http"):
+            domain = "http://" + domain
+        if not url:
+            return domain
+        return domain + "/" + url.lstrip("/")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -398,6 +422,8 @@ class GlobalVar(object):
     """
     # 系统停止事件
     STOP_EVENT: threading.Event = threading.Event()
+    # webpush订阅
+    SUBSCRIPTIONS: List[dict] = []
 
     def stop_system(self):
         """
@@ -410,6 +436,18 @@ class GlobalVar(object):
         是否停止
         """
         return self.STOP_EVENT.is_set()
+
+    def get_subscriptions(self):
+        """
+        获取webpush订阅
+        """
+        return self.SUBSCRIPTIONS
+
+    def push_subscription(self, subscription: dict):
+        """
+        添加webpush订阅
+        """
+        self.SUBSCRIPTIONS.append(subscription)
 
 
 # 实例化配置

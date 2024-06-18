@@ -491,8 +491,10 @@ class TorrentSpider:
         pubdate = torrent(selector.get('selector', '')).clone()
         self.__remove(pubdate, selector)
         items = self.__attribute_or_text(pubdate, selector)
-        self.torrents_info['pubdate'] = self.__index(items, selector)
-        self.torrents_info['pubdate'] = self.__filter_text(self.torrents_info.get('pubdate'),
+        pubdate_str = self.__index(items, selector)
+        if pubdate_str:
+            pubdate_str = pubdate_str.replace('\n', ' ').strip()
+        self.torrents_info['pubdate'] = self.__filter_text(pubdate_str,
                                                            selector.get('filters'))
 
     def __get_date_elapsed(self, torrent):
@@ -674,12 +676,15 @@ class TorrentSpider:
             try:
                 args = filter_item.get("args")
                 if method_name == "re_search" and isinstance(args, list):
-                    text = re.search(r"%s" % args[0], text).group(args[-1])
+                    rematch = re.search(r"%s" % args[0], text)
+                    if rematch:
+                        text = rematch.group(args[-1])
                 elif method_name == "split" and isinstance(args, list):
                     text = text.split(r"%s" % args[0])[args[-1]]
                 elif method_name == "replace" and isinstance(args, list):
                     text = text.replace(r"%s" % args[0], r"%s" % args[-1])
                 elif method_name == "dateparse" and isinstance(args, str):
+                    text = text.replace("\n", " ").strip()
                     text = datetime.datetime.strptime(text, r"%s" % args)
                 elif method_name == "strip":
                     text = text.strip()

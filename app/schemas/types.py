@@ -32,6 +32,8 @@ class EventType(Enum):
     HistoryDeleted = "history.deleted"
     # 删除下载源文件
     DownloadFileDeleted = "downloadfile.deleted"
+    # 删除下载任务
+    DownloadDeleted = "download.deleted"
     # 收到用户外来消息
     UserMessage = "user.message"
     # 收到Webhook消息
@@ -46,6 +48,8 @@ class EventType(Enum):
     SubscribeAdded = "subscribe.added"
     # 订阅已完成
     SubscribeComplete = "subscribe.complete"
+    # 系统错误
+    SystemError = "system.error"
 
 
 # 系统配置Key字典
@@ -90,6 +94,8 @@ class SystemConfigKey(Enum):
     DownloadDirectories = "DownloadDirectories"
     # 媒体库目录定义
     LibraryDirectories = "LibraryDirectories"
+    # 阿里云盘认证参数
+    UserAliyunParams = "UserAliyunParams"
 
 
 # 处理进度Key字典
@@ -120,6 +126,8 @@ class NotificationType(Enum):
     MediaServer = "媒体服务器通知"
     # 处理失败需要人工干预
     Manual = "手动处理通知"
+    # 插件消息
+    Plugin = "插件消息"
 
 
 class MessageChannel(Enum):
@@ -132,6 +140,7 @@ class MessageChannel(Enum):
     SynologyChat = "SynologyChat"
     VoceChat = "VoceChat"
     Web = "Web"
+    WebPush = "WebPush"
 
 
 # 用户配置Key字典

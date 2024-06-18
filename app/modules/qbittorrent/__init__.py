@@ -197,6 +197,7 @@ class QbittorrentModule(_ModuleBase):
                     title=torrent.get('name'),
                     path=torrent_path,
                     hash=torrent.get('hash'),
+                    size=torrent.get('total_size'),
                     tags=torrent.get('tags')
                 ))
         elif status == TorrentStatus.TRANSFER:
@@ -242,7 +243,7 @@ class QbittorrentModule(_ModuleBase):
             return None
         return ret_torrents
 
-    def transfer_completed(self, hashs: Union[str, list], path: Path = None,
+    def transfer_completed(self, hashs: str, path: Path = None,
                            downloader: str = settings.DEFAULT_DOWNLOADER) -> None:
         """
         转移完成后的处理
@@ -254,7 +255,7 @@ class QbittorrentModule(_ModuleBase):
             return
         self.qbittorrent.set_torrents_tag(ids=hashs, tags=['已整理'])
         # 移动模式删除种子
-        if settings.TRANSFER_TYPE == "move":
+        if settings.TRANSFER_TYPE in ["move", "rclone_move"]:
             if self.remove_torrents(hashs):
                 logger.info(f"移动模式删除种子成功：{hashs} ")
             # 删除残留文件

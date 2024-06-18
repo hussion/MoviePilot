@@ -94,11 +94,12 @@ class ChainBase(metaclass=ABCMeta):
         result = None
         modules = self.modulemanager.get_running_modules(method)
         for module in modules:
+            module_id = module.__class__.__name__
             try:
                 module_name = module.get_name()
             except Exception as err:
                 logger.error(f"获取模块名称出错：{str(err)}")
-                module_name = module.__class__.__name__
+                module_name = module_id
             try:
                 func = getattr(module, method)
                 if is_result_empty(result):
@@ -117,10 +118,21 @@ class ChainBase(metaclass=ABCMeta):
                     break
             except Exception as err:
                 logger.error(
-                    f"运行模块 {module.__class__.__name__}.{method} 出错：{str(err)}\n{traceback.format_exc()}")
+                    f"运行模块 {module_id}.{method} 出错：{str(err)}\n{traceback.format_exc()}")
                 self.messagehelper.put(title=f"{module_name}发生了错误",
                                        message=str(err),
                                        role="system")
+                self.eventmanager.send_event(
+                    EventType.SystemError,
+                    {
+                        "type": "module",
+                        "module_id": module_id,
+                        "module_name": module_name,
+                        "module_method": method,
+                        "error": str(err),
+                        "traceback": traceback.format_exc()
+                    }
+                )
         return result
 
     def recognize_media(self, meta: MetaBase = None,
@@ -375,7 +387,7 @@ class ChainBase(metaclass=ABCMeta):
                                transfer_type=transfer_type, target=target, episodes_info=episodes_info,
                                scrape=scrape)
 
-    def transfer_completed(self, hashs: Union[str, list], path: Path = None,
+    def transfer_completed(self, hashs: str, path: Path = None,
                            downloader: str = settings.DEFAULT_DOWNLOADER) -> None:
         """
         转移完成后的处理
