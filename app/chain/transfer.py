@@ -221,9 +221,8 @@ class JobManager:
         """
         移除作业
         """
-        __mediaid__ = self.__get_media_id(media=task.mediainfo, season=task.meta.begin_season)
         with job_lock:
-            # 移除作业
+            __mediaid__ = self.__get_media_id(media=task.mediainfo, season=task.meta.begin_season)
             if __mediaid__ in self._job_view:
                 # 移除季集信息
                 if __mediaid__ in self._season_episodes:
@@ -243,13 +242,10 @@ class JobManager:
             )
         else:
             meta_done = True
-        if __mediaid__ != __metaid__:
-            if __mediaid__ in self._job_view:
-                media_done = all(
-                    task.state in ["completed", "failed"] for task in self._job_view[__mediaid__].tasks
-                )
-            else:
-                media_done = False
+        if __mediaid__ in self._job_view:
+            media_done = all(
+                task.state in ["completed", "failed"] for task in self._job_view[__mediaid__].tasks
+            )
         else:
             media_done = True
         return meta_done and media_done
@@ -266,16 +262,13 @@ class JobManager:
             )
         else:
             meta_finished = True
-        if __mediaid__ != __metaid__:
-            if __mediaid__ in self._job_view:
-                tasks = self._job_view[__mediaid__].tasks
-                media_finished = all(
-                    task.state in ["completed", "failed"] for task in tasks
-                ) and any(
-                    task.state == "completed" for task in tasks
-                )
-            else:
-                media_finished = False
+        if __mediaid__ in self._job_view:
+            tasks = self._job_view[__mediaid__].tasks
+            media_finished = all(
+                task.state in ["completed", "failed"] for task in tasks
+            ) and any(
+                task.state == "completed" for task in tasks
+            )
         else:
             media_finished = True
         return meta_finished and media_finished
@@ -292,13 +285,10 @@ class JobManager:
             )
         else:
             meta_success = True
-        if __mediaid__ != __metaid__:
-            if __mediaid__ in self._job_view:
-                media_success = all(
-                    task.state in ["completed"] for task in self._job_view[__mediaid__].tasks
-                )
-            else:
-                media_success = False
+        if __mediaid__ in self._job_view:
+            media_success = all(
+                task.state in ["completed"] for task in self._job_view[__mediaid__].tasks
+            )
         else:
             media_success = True
         return meta_success and media_success
@@ -308,7 +298,7 @@ class JobManager:
         判断是否有任务正在处理
         """
         if mediainfo:
-            __mediaid__ = self.__get_media_id(media=meta, season=season)
+            __mediaid__ = self.__get_media_id(media=mediainfo, season=season)
             if __mediaid__ in self._job_view:
                 return True
 
@@ -320,59 +310,52 @@ class JobManager:
         获取某项任务成功的任务
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
-        with job_lock:
-            if __mediaid__ not in self._job_view:
-                return []
-            return [task for task in self._job_view[__mediaid__].tasks if task.state == "completed"]
+        if __mediaid__ not in self._job_view:
+            return []
+        return [task for task in self._job_view[__mediaid__].tasks if task.state == "completed"]
 
     def all_tasks(self, media: MediaInfo, season: Optional[int] = None) -> List[TransferJobTask]:
         """
         获取全部任务
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
-        with job_lock:
-            if __mediaid__ not in self._job_view:
-                return []
-            return self._job_view[__mediaid__].tasks
+        if __mediaid__ not in self._job_view:
+            return []
+        return self._job_view[__mediaid__].tasks
 
     def count(self, media: MediaInfo, season: Optional[int] = None) -> int:
         """
-        获取某项任务成功总数
+        获取作业成功总数
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
-        with job_lock:
-            # 计算状态为完成的任务数
-            if __mediaid__ not in self._job_view:
-                return 0
-            return len([task for task in self._job_view[__mediaid__].tasks if task.state == "completed"])
+        if __mediaid__ not in self._job_view:
+            return 0
+        return len([task for task in self._job_view[__mediaid__].tasks if task.state == "completed"])
 
     def size(self, media: MediaInfo, season: Optional[int] = None) -> int:
         """
-        获取某项任务成功文件总大小
+        获取作业成功文件总大小
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
-        with job_lock:
-            # 计算状态为完成的任务数
-            if __mediaid__ not in self._job_view:
-                return 0
-            return sum([
-                task.fileitem.size if task.fileitem.size is not None
-                else (
-                    SystemUtils.get_directory_size(Path(task.fileitem.path)) if task.fileitem.storage == "local" else 0)
-                for task in self._job_view[__mediaid__].tasks
-                if task.state == "completed"
-            ])
+        if __mediaid__ not in self._job_view:
+            return 0
+        return sum([
+            task.fileitem.size if task.fileitem.size is not None
+            else (
+                SystemUtils.get_directory_size(Path(task.fileitem.path)) if task.fileitem.storage == "local" else 0)
+            for task in self._job_view[__mediaid__].tasks
+            if task.state == "completed"
+        ])
 
     def total(self) -> int:
         """
-        获取所有task任务总数
+        获取所有任务总数
         """
-        with job_lock:
-            return sum([len(job.tasks) for job in self._job_view.values()])
+        return sum([len(job.tasks) for job in self._job_view.values()])
 
     def list_jobs(self) -> List[TransferJob]:
         """
-        获取任务列表
+        获取所有任务列表
         """
         return list(self._job_view.values())
 
@@ -381,8 +364,7 @@ class JobManager:
         获取季集清单
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
-        with job_lock:
-            return self._season_episodes.get(__mediaid__) or []
+        return self._season_episodes.get(__mediaid__) or []
 
 
 class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
@@ -527,8 +509,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 })
 
             # 移除已完成的任务
-            with job_lock:
-                self.jobview.remove_job(task)
+            self.jobview.remove_job(task)
 
         transferhis = TransferHistoryOper()
         if not transferinfo.success:
@@ -568,8 +549,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             ))
 
             # 整理失败
-            with job_lock:
-                self.jobview.fail_task(task)
+            self.jobview.fail_task(task)
 
             # 全部整理完成且有成功的任务时
             if self.jobview.is_finished(task):
@@ -579,8 +559,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             return False, transferinfo.message
 
         # task转移成功
-        with job_lock:
-            self.jobview.finish_task(task)
+        self.jobview.finish_task(task)
 
         logger.info(f"{task.fileitem.name} 入库成功：{transferinfo.target_diritem.path}")
 
@@ -639,7 +618,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         # 全部整理完成不管成功还是失败
         if self.jobview.is_done(task):
             # 所有任务
-            tasks = self.jobview.all_tasks()
+            tasks = self.jobview.all_tasks(task.mediainfo, task.meta.begin_season)
             for t in tasks:
                 if t.download_hash:
                     # 设置种子状态为已整理
@@ -666,8 +645,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """
         添加到作业视图
         """
-        with job_lock:
-            self.jobview.add_task(task)
+        self.jobview.add_task(task)
 
     def remove_from_queue(self, fileitem: FileItem):
         """
@@ -675,8 +653,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """
         if not fileitem:
             return
-        with job_lock:
-            self.jobview.remove_task(fileitem)
+        self.jobview.remove_task(fileitem)
 
     def __start_transfer(self):
         """
@@ -919,9 +896,8 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
         finally:
             # 移除已完成的任务
-            with job_lock:
-                if self.jobview.is_done(task):
-                    self.jobview.remove_job(task)
+            if self.jobview.is_done(task):
+                self.jobview.remove_job(task)
 
     def get_queue_tasks(self) -> List[TransferJob]:
         """
