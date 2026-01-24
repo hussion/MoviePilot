@@ -8,7 +8,7 @@ from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage, ToolCall, ToolMessage, SystemMessage, trim_messages
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
 from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
@@ -125,6 +125,7 @@ class MoviePilotAgent:
                     ))
                 elif msg.get("role") == "system":
                     chat_history.add_message(SystemMessage(content=msg.get("content", "")))
+        
         return chat_history
 
     @staticmethod
@@ -198,7 +199,7 @@ class MoviePilotAgent:
         """
         try:
             # 消息裁剪器，防止上下文超出限制
-            trimmer = trim_messages(
+            base_trimmer = trim_messages(
                 max_tokens=settings.LLM_MAX_CONTEXT_TOKENS * 1000 * 0.8,
                 strategy="last",
                 token_counter=self._token_counter,
@@ -206,6 +207,17 @@ class MoviePilotAgent:
                 allow_partial=False,
                 start_on="human",
             )
+            
+            # 包装trimmer，在裁剪后验证工具调用的完整性
+            def validated_trimmer(messages):
+                # 如果输入是 PromptValue，转换为消息列表
+                if hasattr(messages, "to_messages"):
+                    messages = messages.to_messages()
+                trimmed = base_trimmer.invoke(messages)
+                if len(trimmed) < len(messages):
+                    logger.info(f"LangChain消息上下文已裁剪: {len(messages)} -> {len(trimmed)}")
+                return trimmed
+            
             # 创建Agent执行链
             agent = (
                 RunnablePassthrough.assign(
@@ -214,7 +226,7 @@ class MoviePilotAgent:
                     )
                 )
                 | self.prompt
-                | trimmer
+                | RunnableLambda(validated_trimmer)
                 | self.llm.bind_tools(self.tools)
                 | OpenAIToolsAgentOutputParser()
             )
