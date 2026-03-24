@@ -9,12 +9,12 @@ from typing import Optional, List, Dict, Tuple, Set
 
 import websocket
 
-from app.chain.message import MessageChain
 from app.core.cache import FileCache
+from app.core.config import settings
 from app.core.context import MediaInfo, Context
 from app.core.metainfo import MetaInfo
 from app.log import logger
-from app.schemas.types import MessageChannel
+from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 
@@ -27,6 +27,7 @@ class WeChatBot:
     """
 
     _default_ws_url = "wss://openws.work.weixin.qq.com"
+    _ds_url = f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}"
     _heartbeat_interval = 30
     _ack_timeout = 10
 
@@ -356,17 +357,15 @@ class WeChatBot:
             return
 
         logger.info(f"收到来自 {self._config_name} 的企业微信智能机器人消息：userid={sender}, text={text}")
-        self._forward_to_message_chain(userid=sender, text=text)
+        self._forward_to_message_chain(payload)
 
-    def _forward_to_message_chain(self, userid: str, text: str) -> None:
+    def _forward_to_message_chain(self, payload: dict) -> None:
         def _run():
             try:
-                MessageChain().handle_message(
-                    channel=MessageChannel.Wechat,
-                    source=self._config_name,
-                    userid=userid,
-                    username=userid,
-                    text=text,
+                # 回调
+                RequestUtils(timeout=15).post_res(
+                    f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}&source={self._config_name}",
+                    json=payload
                 )
             except Exception as err:
                 logger.error(f"企业微信智能机器人转发消息失败：{err}")

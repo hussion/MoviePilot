@@ -41,6 +41,9 @@ from app.agent.tools.impl.list_directory import ListDirectoryTool
 from app.agent.tools.impl.query_transfer_history import QueryTransferHistoryTool
 from app.agent.tools.impl.transfer_file import TransferFileTool
 from app.agent.tools.impl.execute_command import ExecuteCommandTool
+from app.agent.tools.impl.edit_file import EditFileTool
+from app.agent.tools.impl.write_file import WriteFileTool
+from app.agent.tools.impl.read_file import ReadFileTool
 from app.core.plugin import PluginManager
 from app.log import logger
 from .base import MoviePilotTool
@@ -54,7 +57,7 @@ class MoviePilotToolFactory:
     @staticmethod
     def create_tools(session_id: str, user_id: str,
                      channel: str = None, source: str = None, username: str = None,
-                     callback_handler: Callable = None) -> List[MoviePilotTool]:
+                     stream_handler: Callable = None) -> List[MoviePilotTool]:
         """
         创建MoviePilot工具列表
         """
@@ -100,7 +103,10 @@ class MoviePilotToolFactory:
             RunSchedulerTool,
             QueryWorkflowsTool,
             RunWorkflowTool,
-            ExecuteCommandTool
+            ExecuteCommandTool,
+            EditFileTool,
+            WriteFileTool,
+            ReadFileTool
         ]
         # 创建内置工具
         for ToolClass in tool_definitions:
@@ -109,7 +115,7 @@ class MoviePilotToolFactory:
                 user_id=user_id
             )
             tool.set_message_attr(channel=channel, source=source, username=username)
-            tool.set_callback_handler(callback_handler=callback_handler)
+            tool.set_stream_handler(stream_handler=stream_handler)
             tools.append(tool)
         
         # 加载插件提供的工具
@@ -131,7 +137,7 @@ class MoviePilotToolFactory:
                         user_id=user_id
                     )
                     tool.set_message_attr(channel=channel, source=source, username=username)
-                    tool.set_callback_handler(callback_handler=callback_handler)
+                    tool.set_stream_handler(stream_handler=stream_handler)
                     tools.append(tool)
                     plugin_tools_count += 1
                     logger.debug(f"成功加载插件 {plugin_name}({plugin_id}) 的工具: {ToolClass.__name__}")
