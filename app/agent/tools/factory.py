@@ -36,6 +36,7 @@ from app.agent.tools.impl.query_workflows import QueryWorkflowsTool
 from app.agent.tools.impl.run_workflow import RunWorkflowTool
 from app.agent.tools.impl.update_site_cookie import UpdateSiteCookieTool
 from app.agent.tools.impl.delete_download import DeleteDownloadTool
+from app.agent.tools.impl.delete_download_history import DeleteDownloadHistoryTool
 from app.agent.tools.impl.modify_download import ModifyDownloadTool
 from app.agent.tools.impl.query_directory_settings import QueryDirectorySettingsTool
 from app.agent.tools.impl.list_directory import ListDirectoryTool
@@ -46,6 +47,9 @@ from app.agent.tools.impl.edit_file import EditFileTool
 from app.agent.tools.impl.write_file import WriteFileTool
 from app.agent.tools.impl.read_file import ReadFileTool
 from app.agent.tools.impl.browse_webpage import BrowseWebpageTool
+from app.agent.tools.impl.query_installed_plugins import QueryInstalledPluginsTool
+from app.agent.tools.impl.query_plugin_capabilities import QueryPluginCapabilitiesTool
+from app.agent.tools.impl.run_plugin_command import RunPluginCommandTool
 from app.core.plugin import PluginManager
 from app.log import logger
 from .base import MoviePilotTool
@@ -92,6 +96,7 @@ class MoviePilotToolFactory:
             DeleteSubscribeTool,
             QueryDownloadTasksTool,
             DeleteDownloadTool,
+            DeleteDownloadHistoryTool,
             ModifyDownloadTool,
             QueryDownloadersTool,
             QuerySitesTool,
@@ -116,6 +121,9 @@ class MoviePilotToolFactory:
             WriteFileTool,
             ReadFileTool,
             BrowseWebpageTool,
+            QueryInstalledPluginsTool,
+            QueryPluginCapabilitiesTool,
+            RunPluginCommandTool,
         ]
         # 创建内置工具
         for ToolClass in tool_definitions:
