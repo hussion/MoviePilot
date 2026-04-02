@@ -101,7 +101,10 @@ class Telegram:
                     "温馨提示：直接发送名称或`订阅`+名称，搜索或订阅电影、电视剧",
                 )
 
-            @_bot.message_handler(func=lambda message: True)
+            @_bot.message_handler(content_types=[
+                "text", "photo", "video", "document", "animation",
+                "audio", "voice", "sticker", "video_note",
+            ], func=lambda message: True)
             def echo_all(message):
                 # Update user-chat mapping when receiving messages
                 self._update_user_chat_mapping(message.from_user.id, message.chat.id)
@@ -330,6 +333,7 @@ class Telegram:
             buttons: Optional[List[List[dict]]] = None,
             original_message_id: Optional[int] = None,
             original_chat_id: Optional[str] = None,
+            disable_web_page_preview: Optional[bool] = None,
     ) -> Optional[dict]:
         """
         发送Telegram消息
@@ -341,6 +345,7 @@ class Telegram:
         :param buttons: 按钮列表，格式：[[{"text": "按钮文本", "callback_data": "回调数据"}]]
         :param original_message_id: 原消息ID，如果提供则编辑原消息
         :param original_chat_id: 原消息的聊天ID，编辑消息时需要
+        :param disable_web_page_preview: 是否禁用链接预览
         :return: 包含 message_id, chat_id, success 的字典
         """
         if not self._telegram_token or not self._telegram_chat_id:
@@ -394,6 +399,7 @@ class Telegram:
                     image=image,
                     caption=caption,
                     reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview,
                 )
                 self._stop_typing_task(chat_id)
                 if sent and hasattr(sent, "message_id"):
@@ -763,10 +769,12 @@ class Telegram:
             image="",
             caption="",
             reply_markup: Optional[InlineKeyboardMarkup] = None,
+            disable_web_page_preview: Optional[bool] = None,
     ):
         """
         向Telegram发送报文，返回发送的消息对象
         :param reply_markup: 内联键盘
+        :param disable_web_page_preview: 是否禁用链接预览
         :return: 发送成功返回消息对象，失败返回None
         """
         kwargs = {
@@ -774,7 +782,6 @@ class Telegram:
             "parse_mode": "MarkdownV2",
             "reply_markup": reply_markup,
         }
-
         # 处理图片
         image = self.__process_image(image)
 
@@ -782,10 +789,14 @@ class Telegram:
             # 图片消息的标题长度限制为1024，文本消息为4096
             caption_limit = 1024 if image else 4096
             if len(caption) < caption_limit:
-                ret = self.__send_short_message(image, caption, **kwargs)
+                ret = self.__send_short_message(image, caption,
+                                                disable_web_page_preview=disable_web_page_preview,
+                                                **kwargs)
             else:
                 sent_idx = set()
-                ret = self.__send_long_message(image, caption, sent_idx, **kwargs)
+                ret = self.__send_long_message(image, caption, sent_idx,
+                                               disable_web_page_preview=disable_web_page_preview,
+                                               **kwargs)
 
             return ret
         except Exception as e:
@@ -805,7 +816,8 @@ class Telegram:
         return image
 
     @retry(RetryException, logger=logger)
-    def __send_short_message(self, image: Optional[bytes], caption: str, **kwargs):
+    def __send_short_message(self, image: Optional[bytes], caption: str,
+                             disable_web_page_preview: Optional[bool] = None, **kwargs):
         """
         发送短消息
         """
@@ -815,13 +827,18 @@ class Telegram:
                     photo=image, caption=standardize(caption), **kwargs
                 )
             else:
-                return self._bot.send_message(text=standardize(caption), **kwargs)
+                return self._bot.send_message(
+                    text=standardize(caption),
+                    disable_web_page_preview=disable_web_page_preview,
+                    **kwargs
+                )
         except Exception:
             raise RetryException(f"发送{'图片' if image else '文本'}消息失败")
 
     @retry(RetryException, logger=logger)
     def __send_long_message(
-            self, image: Optional[bytes], caption: str, sent_idx: set, **kwargs
+            self, image: Optional[bytes], caption: str, sent_idx: set,
+            disable_web_page_preview: Optional[bool] = None, **kwargs
     ):
         """
         发送长消息
@@ -845,8 +862,11 @@ class Telegram:
                 current_reply_markup = reply_markup if i == 0 else None
 
                 if item.content_type == ContentTypes.TEXT and (i != 0 or not image):
+                    msg_kwargs = dict(**kwargs)
+                    if disable_web_page_preview is not None:
+                        msg_kwargs["disable_web_page_preview"] = disable_web_page_preview
                     ret = self._bot.send_message(
-                        **kwargs, text=item.content, reply_markup=current_reply_markup
+                        **msg_kwargs, text=item.content, reply_markup=current_reply_markup
                     )
 
                 elif item.content_type == ContentTypes.PHOTO or (image and i == 0):
