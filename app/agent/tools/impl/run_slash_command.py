@@ -1,4 +1,4 @@
-"""运行插件/系统命令工具"""
+"""运行斜杠命令工具（系统命令 + 插件命令）"""
 
 import json
 from typing import Optional, Type
@@ -6,14 +6,13 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
-from app.command import Command
 from app.core.event import eventmanager
 from app.log import logger
 from app.schemas.types import EventType, MessageChannel
 
 
-class RunPluginCommandInput(BaseModel):
-    """运行插件/系统命令工具的输入参数模型"""
+class RunSlashCommandInput(BaseModel):
+    """运行斜杠命令工具的输入参数模型"""
 
     explanation: str = Field(
         ...,
@@ -24,23 +23,23 @@ class RunPluginCommandInput(BaseModel):
         description="The slash command to execute, e.g. '/cookiecloud'. "
         "Must start with '/'. Can include arguments after the command, e.g. '/command arg1 arg2'. "
         "Use query_plugin_capabilities tool to discover available plugin commands, "
-        "or list_all_commands tool to discover all available commands (including system commands).",
+        "or list_slash_commands tool to discover all available commands (including system commands).",
     )
 
 
-class RunPluginCommandTool(MoviePilotTool):
-    name: str = "run_plugin_command"
+class RunSlashCommandTool(MoviePilotTool):
+    name: str = "run_slash_command"
     description: str = (
-        "Execute a system or plugin command by sending a CommandExcute event. "
-        "This tool supports ALL registered commands, including: "
+        "Execute a slash command (system or plugin) by sending a CommandExcute event. "
+        "This tool supports ALL registered slash commands, including: "
         "1) System preset commands (e.g. /cookiecloud, /sites, /subscribes, /downloading, /transfer, /restart, etc.) "
         "2) Plugin commands registered by installed plugins. "
         "Use the query_plugin_capabilities tool to discover plugin commands, "
-        "or the list_all_commands tool to discover all available commands. "
+        "or the list_slash_commands tool to discover all available commands. "
         "The command will be executed asynchronously. "
         "Note: This tool triggers the command execution but the actual processing happens in the background."
     )
-    args_schema: Type[BaseModel] = RunPluginCommandInput
+    args_schema: Type[BaseModel] = RunSlashCommandInput
     require_admin: bool = True
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
@@ -57,6 +56,8 @@ class RunPluginCommandTool(MoviePilotTool):
                 command = f"/{command}"
 
             # 从全局 Command 单例中验证命令是否存在（包含系统预设命令 + 插件命令 + 其他命令）
+            from app.command import Command
+
             cmd_name = command.split()[0]
             command_obj = Command()
             matched_command = command_obj.get(cmd_name)

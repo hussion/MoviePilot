@@ -1,5 +1,5 @@
 ---
-name: command-execute
+name: command-dispatch
 description: >-
   Use this skill when the user's intent is to execute a system or plugin function. Applicable scenarios include:
   1) The user sends a slash command starting with / (e.g. /cookiecloud, /sites, /subscribes, etc.);
@@ -7,12 +7,12 @@ description: >-
   (e.g. "sync sites", "show subscriptions", "refresh subscriptions", "check downloads", etc.).
   This skill helps you identify the user's intent, find the matching command, extract necessary parameters,
   and execute the corresponding command.
-allowed-tools: list_all_commands query_plugin_capabilities run_plugin_command
+allowed-tools: list_slash_commands query_plugin_capabilities run_slash_command
 ---
 
-# Command Execute
+# Command Dispatch
 
-Use this skill to identify user intent and invoke the corresponding system or plugin command.
+Use this skill to identify user intent and dispatch the corresponding system or plugin command.
 
 ## When to Use
 
@@ -29,9 +29,9 @@ Use this skill to identify user intent and invoke the corresponding system or pl
 
 ## Tools
 
-- `list_all_commands` — List all available commands (system + plugin), returns command name, description, and category
+- `list_slash_commands` — List all available slash commands (system + plugin), returns command name, description, and category
 - `query_plugin_capabilities` — Query detailed plugin capabilities (commands, actions, scheduled services)
-- `run_plugin_command` — Execute a specified command (works for both system and plugin commands)
+- `run_slash_command` — Execute a specified command (works for both system and plugin commands)
 
 ## Workflow
 
@@ -44,7 +44,7 @@ Determine whether the user's message is requesting the execution of a command:
 
 ### Step 2: Find Matching Command
 
-Use `list_all_commands` to retrieve all available commands. Match the user's described intent against the `description` and `category` fields of each command.
+Use `list_slash_commands` to retrieve all available commands. Match the user's described intent against the `description` and `category` fields of each command.
 
 If the user's description involves a specific plugin's functionality, additionally use `query_plugin_capabilities` to query that plugin's detailed capabilities.
 
@@ -59,7 +59,7 @@ Some commands support additional arguments (space-separated after the command), 
 - `/redo <history_id>` — Manually re-organize a specific record
 - `/subscribe_delete <name>` — Delete a specific subscription
 
-Use `run_plugin_command` to execute the command in the format `/command_name arg1 arg2`.
+Use `run_slash_command` to execute the command in the format `/command_name arg1 arg2`.
 
 ### Step 4: Report Result
 
@@ -68,6 +68,6 @@ Command execution is asynchronous. After triggering, inform the user that the co
 ## Important Notes
 
 - Command execution requires admin privileges; the tool will automatically check permissions
-- Both system and plugin commands are executed via the `run_plugin_command` tool — no need to distinguish between them
-- If you are unsure which command matches the user's intent, use `list_all_commands` first to look up before deciding
+- Both system and plugin commands are executed via the `run_slash_command` tool — no need to distinguish between them
+- If you are unsure which command matches the user's intent, use `list_slash_commands` first to look up before deciding
 - Never guess non-existent commands; always select from the available command list
