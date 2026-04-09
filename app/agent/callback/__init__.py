@@ -348,6 +348,13 @@ class StreamingHandler:
         return self._streaming_enabled
 
     @property
+    def is_auto_flushing(self) -> bool:
+        """
+        是否正在定时刷新（渠道支持消息编辑时自动推送 buffer 内容）
+        """
+        return self._flush_task is not None
+
+    @property
     def has_sent_message(self) -> bool:
         """
         是否已经通过流式输出发送过消息（当前轮次）
