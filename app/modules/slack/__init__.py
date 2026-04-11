@@ -193,9 +193,14 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
         if not client_config:
             return None
         try:
-            msg_json: dict = json.loads(body)
+            msg_json = json.loads(body)
+            while isinstance(msg_json, str):
+                msg_json = json.loads(msg_json)
         except Exception as err:
             logger.debug(f"解析Slack消息失败：{str(err)}")
+            return None
+        if not isinstance(msg_json, dict):
+            logger.debug(f"Slack消息格式无效：{type(msg_json)}")
             return None
         if msg_json:
             images = None
@@ -279,11 +284,39 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
             return None
         images = []
         for file in files:
-            if file.get("type") in ("image", "jpg", "jpeg", "png", "gif", "webp"):
+            file_type = str(file.get("type", "")).lower()
+            file_ext = str(file.get("filetype", "")).lower()
+            mime_type = str(file.get("mimetype", "")).lower()
+            if (
+                file_type == "image"
+                or file_ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp")
+                or mime_type.startswith("image/")
+            ):
                 url = file.get("url_private") or file.get("url_private_download")
                 if url:
                     images.append(url)
         return images if images else None
+
+    def download_file_to_data_url(self, file_url: str, source: str) -> Optional[str]:
+        """
+        下载Slack文件并转为data URL
+        :param file_url: Slack私有文件URL
+        :param source: 来源名称
+        :return: data URL
+        """
+        config = self.get_config(source)
+        if not config:
+            return None
+        client = self.get_instance(config.name)
+        if not client:
+            return None
+        file_data = client.download_file(file_url)
+        if file_data:
+            import base64
+
+            content, mime_type = file_data
+            return f"data:{mime_type};base64,{base64.b64encode(content).decode()}"
+        return None
 
     def post_message(self, message: Notification, **kwargs) -> None:
         """
