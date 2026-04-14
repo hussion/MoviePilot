@@ -74,10 +74,13 @@ class JobManager:
     _job_view: Dict[Tuple, TransferJob] = {}
     # 汇总季集清单
     _season_episodes: Dict[Tuple, List[int]] = {}
+    # 记录从 meta 作业迁移到 media 作业的关系，用于清理提前失败后残留的 media 作业
+    _meta_to_media_ids: Dict[Tuple, set[Tuple]] = {}
 
     def __init__(self):
         self._job_view = {}
         self._season_episodes = {}
+        self._meta_to_media_ids = {}
 
     @staticmethod
     def __get_meta_id(meta: MetaBase = None, season: Optional[int] = None) -> Tuple:
@@ -185,6 +188,43 @@ class JobManager:
                 self._season_episodes[__mediaid__] = task.meta.episode_list
             return True
 
+    def migrate_task(self, task: TransferTask) -> bool:
+        """
+        将任务从 meta 作业迁移到 media 作业
+        """
+        curr_task, source_job_id = self.__remove_task_with_job_id(task.fileitem)
+        if not self.add_task(task, state=curr_task.state if curr_task else "waiting"):
+            return False
+        if curr_task and task.mediainfo:
+            metaid = self.__get_meta_id(
+                meta=task.meta, season=task.meta.begin_season
+            )
+            mediaid = self.__get_id(task)
+            if source_job_id == metaid and mediaid != metaid:
+                with job_lock:
+                    self._meta_to_media_ids.setdefault(metaid, set()).add(mediaid)
+        return True
+
+    def __is_job_done(self, job_id: Tuple) -> bool:
+        """
+        检查指定作业是否已完成
+        """
+        if job_id not in self._job_view:
+            return True
+        return all(
+            task.state in ["completed", "failed"]
+            for task in self._job_view[job_id].tasks
+        )
+
+    def __pop_job(self, job_id: Tuple):
+        """
+        移除指定作业和对应季集缓存
+        """
+        if job_id in self._season_episodes:
+            self._season_episodes.pop(job_id)
+        if job_id in self._job_view:
+            self._job_view.pop(job_id)
+
     def running_task(self, task: TransferTask):
         """
         设置任务为运行中
@@ -233,9 +273,38 @@ class JobManager:
                     - set(task.meta.episode_list)
                 )
 
+    def fail_unfinished_task(self, task: TransferTask):
+        """
+        将指定任务视图中的非终态任务标记为失败
+        """
+        if not task or not task.fileitem:
+            return
+        with job_lock:
+            for mediaid, job in self._job_view.items():
+                for job_task in job.tasks:
+                    if job_task.fileitem != task.fileitem:
+                        continue
+                    if job_task.state not in ["completed", "failed"]:
+                        job_task.state = "failed"
+                        if mediaid in self._season_episodes:
+                            self._season_episodes[mediaid] = list(
+                                set(self._season_episodes[mediaid])
+                                - set(task.meta.episode_list)
+                            )
+                    return
+
     def remove_task(self, fileitem: FileItem) -> Optional[TransferJobTask]:
         """
         根据文件项移除任务
+        """
+        task, _ = self.__remove_task_with_job_id(fileitem)
+        return task
+
+    def __remove_task_with_job_id(
+        self, fileitem: FileItem
+    ) -> Tuple[Optional[TransferJobTask], Optional[Tuple]]:
+        """
+        根据文件项移除任务，并返回任务所在的作业ID
         """
         with job_lock:
             for mediaid in list(self._job_view):
@@ -252,8 +321,8 @@ class JobManager:
                                 set(self._season_episodes[mediaid])
                                 - set(task.meta.episode_list)
                             )
-                        return task
-            return None
+                        return task, mediaid
+            return None, None
 
     def remove_job(self, task: TransferTask) -> Optional[TransferJob]:
         """
@@ -280,27 +349,20 @@ class JobManager:
                 media=task.mediainfo, season=task.meta.begin_season
             )
 
-            meta_done = True
-            if __metaid__ in self._job_view:
-                meta_done = all(
-                    t.state in ["completed", "failed"]
-                    for t in self._job_view[__metaid__].tasks
-                )
+            related_media_ids = set(self._meta_to_media_ids.get(__metaid__, set()))
+            if task.mediainfo:
+                related_media_ids.add(__mediaid__)
 
-            media_done = True
-            if __mediaid__ in self._job_view:
-                media_done = all(
-                    t.state in ["completed", "failed"]
-                    for t in self._job_view[__mediaid__].tasks
-                )
+            meta_done = self.__is_job_done(__metaid__)
+            media_done = all(
+                self.__is_job_done(mediaid) for mediaid in related_media_ids
+            )
 
             if meta_done and media_done:
-                __id__ = self.__get_id(task)
-                if __id__ in self._job_view:
-                    # 移除季集信息
-                    if __id__ in self._season_episodes:
-                        self._season_episodes.pop(__id__)
-                    self._job_view.pop(__id__)
+                remove_ids = {__metaid__, self.__get_id(task), *related_media_ids}
+                for job_id in remove_ids:
+                    self.__pop_job(job_id)
+                self._meta_to_media_ids.pop(__metaid__, None)
 
     def is_done(self, task: TransferTask) -> bool:
         """
@@ -967,6 +1029,17 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             return
         self.jobview.remove_task(fileitem)
 
+    def __fail_transfer_task(self, task: TransferTask):
+        """
+        标记异常整理任务失败并清理作业视图
+        """
+        self.jobview.fail_unfinished_task(task)
+        if task.download_hash and self.jobview.is_torrent_done(task.download_hash):
+            self.transfer_completed(
+                hashs=task.download_hash, downloader=task.downloader
+            )
+        self.jobview.try_remove_job(task)
+
     def __start_transfer(self):
         """
         处理队列
@@ -1043,6 +1116,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     logger.error(
                         f"{fileitem.name} 整理任务处理出现错误：{e} - {traceback.format_exc()}"
                     )
+                    self.__fail_transfer_task(task)
                     with task_lock:
                         self._processed_num += 1
                         self._fail_num += 1
@@ -1170,10 +1244,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 # 更新任务信息
                 task.mediainfo = mediainfo
                 # 更新队列任务
-                curr_task = self.jobview.remove_task(task.fileitem)
-                self.jobview.add_task(
-                    task, state=curr_task.state if curr_task else "waiting"
-                )
+                self.jobview.migrate_task(task)
 
             # 获取集数据
             if task.mediainfo.type == MediaType.TV and not task.episodes_info:
@@ -1771,9 +1842,17 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                             "finished": finished_files,
                         },
                     )
-                    state, err_msg = self.__handle_transfer(
-                        task=transfer_task, callback=self.__default_callback
-                    )
+                    try:
+                        state, err_msg = self.__handle_transfer(
+                            task=transfer_task, callback=self.__default_callback
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"{transfer_task.fileitem.name} 整理任务处理出现错误："
+                            f"{e} - {traceback.format_exc()}"
+                        )
+                        self.__fail_transfer_task(transfer_task)
+                        state, err_msg = False, str(e)
                     if not state:
                         all_success = False
                         logger.warn(f"{transfer_task.fileitem.name} {err_msg}")
