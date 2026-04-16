@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v2/scripts/bootst
 脚本会自动：
 
 - 检测操作系统
-- 检查 `git`、`curl`、`Python 3.12+`
+- 自动检查并尽量安装 `git`、`curl`、`Python 3.12+`
 - 克隆 `MoviePilot`
 - 安装后端依赖
 - 下载 `MoviePilot-Frontend` 最新 release 的 `dist.zip`
@@ -21,6 +21,12 @@ curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v2/scripts/bootst
 - 执行初始化向导
 - 创建全局 `moviepilot` 命令
 - 默认启动前后端服务
+
+说明：
+
+- 如果系统里没有可用的 `Python 3.12+`，脚本会优先尝试自动补齐运行环境，再继续安装
+- Linux 下安装系统依赖时通常需要 `sudo`
+- 复用已有仓库时，脚本现在只会因为已跟踪源码改动而阻止自动更新，不会再被 `.DS_Store` 之类未跟踪文件卡住
 
 如果安装完成后当前终端仍提示找不到 `moviepilot`：
 
@@ -212,6 +218,8 @@ moviepilot setup --config-dir /path/to/moviepilot-config
 - 默认下载目录与媒体库目录
 - AI Agent
   可按需启用，并配置 `LLM_PROVIDER`、`LLM_MODEL`、`LLM_API_KEY`、`LLM_BASE_URL`
+- 用户站点认证
+  可按需选择认证站点，并按站点要求填写用户名、UID、Passkey 等参数
 - 下载器
 - 媒体服务器
 - 消息通知渠道
@@ -287,6 +295,7 @@ moviepilot version
 说明：
 
 - `start` 会先启动后端，再启动前端
+- 通过系统内置的重启入口触发重启时，本地 CLI 安装模式也会复用同一套前后端进程管理完成重启
 - 前端默认监听 `NGINX_PORT`，默认值 `3000`
 - 后端默认监听 `PORT`，默认值 `3001`
 - 前端通过 `service.js` 代理 `/api` 与 `/cookiecloud` 到后端
