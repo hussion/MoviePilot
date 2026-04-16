@@ -40,6 +40,20 @@ DEFAULT_NODE_VERSION = "20.12.1"
 FRONTEND_LATEST_API = "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases/latest"
 FRONTEND_TAG_API = "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases/tags/{tag}"
 RESOURCES_MAIN_ZIP = "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip"
+LLM_PROVIDER_DEFAULTS = {
+    "deepseek": {
+        "model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com",
+    },
+    "openai": {
+        "model": "gpt-4o-mini",
+        "base_url": "https://api.openai.com/v1",
+    },
+    "google": {
+        "model": "gemini-2.5-flash",
+        "base_url": "",
+    },
+}
 RUNTIME_PACKAGE = {
     "name": "moviepilot-frontend-runtime",
     "private": True,
@@ -218,6 +232,14 @@ def _load_env_lines() -> list[str]:
     return ENV_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
 
 
+def _serialize_env_value(value: Any) -> str:
+    if isinstance(value, Path):
+        value = str(value)
+    if value is None:
+        return '""'
+    return json.dumps(value, ensure_ascii=False)
+
+
 def read_env_value(key: str) -> Optional[str]:
     for line in _load_env_lines():
         stripped = line.strip()
@@ -232,7 +254,7 @@ def read_env_value(key: str) -> Optional[str]:
 def write_env_value(key: str, value: str) -> None:
     ensure_local_dirs()
     lines = _load_env_lines()
-    new_line = f"{key}={json.dumps(str(value), ensure_ascii=False)}\n"
+    new_line = f"{key}={_serialize_env_value(value)}\n"
 
     for index, line in enumerate(lines):
         stripped = line.strip()
@@ -248,6 +270,11 @@ def write_env_value(key: str, value: str) -> None:
         lines.append(new_line)
 
     ENV_FILE.write_text("".join(lines), encoding="utf-8")
+
+
+def write_env_values(values: dict[str, Any]) -> None:
+    for key, value in values.items():
+        write_env_value(key, value)
 
 
 def ensure_api_token(force_token: bool = False, token: Optional[str] = None) -> str:
@@ -546,6 +573,30 @@ def _normalize_choice(value: str) -> str:
     return value.strip().lower().replace("_", "").replace("-", "")
 
 
+def _env_default(key: str, default: str = "") -> str:
+    value = read_env_value(key)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = read_env_value(key)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(key: str, default: int) -> int:
+    value = read_env_value(key)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _prompt_text(
     label: str,
     *,
@@ -566,6 +617,29 @@ def _prompt_text(
         if allow_empty:
             return ""
         print("请输入有效内容，或使用回车接受默认值。")
+
+
+def _prompt_secret_text(
+    label: str,
+    *,
+    current_value: Optional[str] = None,
+    allow_empty: bool = False,
+    required: bool = False,
+) -> str:
+    while True:
+        suffix = " [留空保持现有值]" if current_value not in (None, "") else ""
+        prompt = f"{label}{suffix}: "
+        value = getpass.getpass(prompt).strip()
+
+        if value:
+            return value
+        if current_value is not None and current_value != "":
+            return current_value
+        if allow_empty and not required:
+            return ""
+        if not required:
+            return ""
+        print("请输入有效内容。")
 
 
 def _prompt_yes_no(label: str, default: bool = True) -> bool:
@@ -650,6 +724,55 @@ def _collect_directory_config() -> dict[str, Any]:
         "library_type_folder": True,
         "library_category_folder": False,
     }
+
+
+def _collect_database_config() -> dict[str, Any]:
+    print_step("数据库配置")
+    current_db_type = _env_default("DB_TYPE", "sqlite").lower()
+    if current_db_type not in {"sqlite", "postgresql"}:
+        current_db_type = "sqlite"
+
+    db_type = _prompt_choice(
+        "选择数据库类型",
+        {
+            "sqlite": "SQLite",
+            "postgresql": "PostgreSQL",
+        },
+        default=current_db_type,
+    )
+
+    config: dict[str, Any] = {
+        "DB_TYPE": db_type,
+    }
+    if db_type == "sqlite":
+        return config
+
+    config.update(
+        {
+            "DB_POSTGRESQL_HOST": _prompt_text(
+                "PostgreSQL 主机地址",
+                default=_env_default("DB_POSTGRESQL_HOST", "localhost"),
+            ),
+            "DB_POSTGRESQL_PORT": _prompt_text(
+                "PostgreSQL 端口",
+                default=str(_env_int("DB_POSTGRESQL_PORT", 5432)),
+            ),
+            "DB_POSTGRESQL_DATABASE": _prompt_text(
+                "PostgreSQL 数据库名（需已创建）",
+                default=_env_default("DB_POSTGRESQL_DATABASE", "moviepilot"),
+            ),
+            "DB_POSTGRESQL_USERNAME": _prompt_text(
+                "PostgreSQL 用户名",
+                default=_env_default("DB_POSTGRESQL_USERNAME", "moviepilot"),
+            ),
+            "DB_POSTGRESQL_PASSWORD": _prompt_secret_text(
+                "PostgreSQL 密码",
+                current_value=read_env_value("DB_POSTGRESQL_PASSWORD"),
+                allow_empty=True,
+            ),
+        }
+    )
+    return config
 
 
 def _collect_downloader_config() -> Optional[dict[str, Any]]:
@@ -808,6 +931,73 @@ def _collect_notification_config() -> Optional[dict[str, Any]]:
     }
 
 
+def _collect_agent_config() -> dict[str, Any]:
+    print_step("AI Agent 配置")
+    enabled = _prompt_yes_no(
+        "是否启用 AI 智能体",
+        default=_env_bool("AI_AGENT_ENABLE", False),
+    )
+    if not enabled:
+        return {
+            "AI_AGENT_ENABLE": False,
+            "AI_AGENT_GLOBAL": False,
+        }
+
+    current_provider = _env_default("LLM_PROVIDER", "deepseek").lower()
+    if current_provider not in LLM_PROVIDER_DEFAULTS:
+        current_provider = "deepseek"
+
+    provider = _prompt_choice(
+        "选择 LLM 提供商",
+        {
+            "deepseek": "DeepSeek",
+            "openai": "OpenAI",
+            "google": "Google",
+        },
+        default=current_provider,
+    )
+    defaults = LLM_PROVIDER_DEFAULTS[provider]
+    current_model = _env_default("LLM_MODEL", defaults["model"])
+    current_base_url = _env_default("LLM_BASE_URL", defaults["base_url"])
+
+    config: dict[str, Any] = {
+        "AI_AGENT_ENABLE": True,
+        "AI_AGENT_GLOBAL": _prompt_yes_no(
+            "是否启用全局 AI 智能体",
+            default=_env_bool("AI_AGENT_GLOBAL", False),
+        ),
+        "LLM_PROVIDER": provider,
+        "LLM_MODEL": _prompt_text(
+            "LLM 模型名称",
+            default=current_model,
+        ),
+        "LLM_API_KEY": _prompt_secret_text(
+            "LLM API Key",
+            current_value=read_env_value("LLM_API_KEY"),
+            required=True,
+        ),
+        "LLM_SUPPORT_IMAGE_INPUT": _prompt_yes_no(
+            "是否启用图片输入支持",
+            default=_env_bool("LLM_SUPPORT_IMAGE_INPUT", True),
+        ),
+    }
+
+    if provider == "google":
+        config["LLM_BASE_URL"] = _prompt_text(
+            "自定义 Google API Base URL（可选）",
+            default=current_base_url,
+            allow_empty=True,
+        )
+    else:
+        config["LLM_BASE_URL"] = _prompt_text(
+            "LLM Base URL",
+            default=current_base_url,
+            allow_empty=True,
+        )
+
+    return config
+
+
 def run_setup_wizard(force_token: bool) -> dict[str, Any]:
     if not _is_interactive():
         raise RuntimeError("交互式向导需要在终端中运行，请直接执行 moviepilot setup --wizard 或 moviepilot init --wizard")
@@ -841,6 +1031,10 @@ def run_setup_wizard(force_token: bool) -> dict[str, Any]:
 
     return {
         "api_token": api_token,
+        "env_settings": {
+            **_collect_database_config(),
+            **_collect_agent_config(),
+        },
         "directories": [_collect_directory_config()],
         "downloader": _collect_downloader_config(),
         "mediaserver": _collect_media_server_config(),
@@ -899,7 +1093,7 @@ def _merge_notification_switches(existing_items: list[dict]) -> list[dict]:
     return [merged[key] for key in [*preferred_order, *extras]]
 
 
-def apply_local_system_config(config_payload: dict[str, Any]) -> None:
+def _apply_local_system_config_inner(config_payload: dict[str, Any]) -> None:
     for directory in config_payload.get("directories") or []:
         download_path = directory.get("download_path")
         library_path = directory.get("library_path")
@@ -953,6 +1147,41 @@ def apply_local_system_config(config_payload: dict[str, Any]) -> None:
     print_step("已写入本地系统配置")
 
 
+def _current_python_matches(target_python: Optional[Path]) -> bool:
+    if not target_python:
+        return True
+    current_python = Path(sys.executable).expanduser()
+    target_python = target_python.expanduser()
+    if not current_python.is_absolute():
+        current_python = (ROOT / current_python).absolute()
+    if not target_python.is_absolute():
+        target_python = (ROOT / target_python).absolute()
+    return str(current_python) == str(target_python)
+
+
+def apply_local_system_config(config_payload: dict[str, Any], runtime_python: Optional[Path] = None) -> None:
+    if _current_python_matches(runtime_python):
+        _apply_local_system_config_inner(config_payload)
+        return
+
+    with TemporaryDirectory() as temp_dir:
+        payload_path = Path(temp_dir) / "moviepilot-config.json"
+        payload_path.write_text(
+            json.dumps(config_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        run(
+            [
+                str(runtime_python),
+                str(Path(__file__).resolve()),
+                "apply-config",
+                "--config-json-file",
+                str(payload_path),
+            ],
+            cwd=ROOT,
+        )
+
+
 def init_local(
     *,
     resources_repo: Optional[Path],
@@ -961,6 +1190,7 @@ def init_local(
     resources_ready: bool,
     force_token: bool,
     wizard: bool,
+    runtime_python: Optional[Path] = None,
 ) -> None:
     ensure_local_dirs()
 
@@ -969,6 +1199,10 @@ def init_local(
         wizard_payload = run_setup_wizard(force_token=force_token)
     else:
         ensure_api_token(force_token=force_token)
+
+    if wizard_payload and wizard_payload.get("env_settings"):
+        write_env_values(wizard_payload["env_settings"])
+        print_step(f"已写入环境配置到 {ENV_FILE}")
 
     if skip_resources:
         if resources_ready:
@@ -979,7 +1213,7 @@ def init_local(
         install_resources(resources_repo=resources_repo, resource_dir=resource_dir)
 
     if wizard_payload:
-        apply_local_system_config(wizard_payload)
+        apply_local_system_config(wizard_payload, runtime_python=runtime_python)
 
 
 def install_deps(*, python_bin: str, venv_dir: Path, recreate: bool) -> Path:
@@ -1178,6 +1412,9 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--skip-resources", action="store_true", help="更新 all 时跳过资源同步")
     update_parser.add_argument("--config-dir", help="配置目录，默认使用程序目录外的系统配置目录")
 
+    apply_config_parser = subparsers.add_parser("apply-config", help=argparse.SUPPRESS)
+    apply_config_parser.add_argument("--config-json-file", required=True, help=argparse.SUPPRESS)
+
     return parser
 
 
@@ -1222,6 +1459,7 @@ def main() -> int:
                 resources_ready=False,
                 force_token=args.force_token,
                 wizard=args.wizard,
+                runtime_python=None,
             )
             print_step("初始化完成")
             print_step(f"当前配置目录：{config_dir}")
@@ -1248,6 +1486,7 @@ def main() -> int:
                 resources_ready=resources_installed,
                 force_token=args.force_token,
                 wizard=args.wizard,
+                runtime_python=venv_python,
             )
             print_step(f"本地环境已完成安装与初始化：{venv_python}")
             print_step(f"当前配置目录：{config_dir}")
@@ -1281,6 +1520,13 @@ def main() -> int:
                 install_resources(resources_repo=None, resource_dir=None)
                 print_step("资源文件已同步到最新")
             print_step(f"更新完成，当前配置目录：{config_dir}")
+            return 0
+
+        if args.command == "apply-config":
+            payload = json.loads(Path(args.config_json_file).read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("配置负载格式错误")
+            _apply_local_system_config_inner(payload)
             return 0
     except subprocess.CalledProcessError as exc:
         print(f"命令执行失败，退出码：{exc.returncode}", file=sys.stderr)
