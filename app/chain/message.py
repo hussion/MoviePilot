@@ -11,11 +11,13 @@ import uuid
 import base64
 
 from app.agent import agent_manager
+from app.agent.interaction import agent_interaction_manager
 from app.chain import ChainBase
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
+from app.chain.transfer import TransferChain
 from app.core.config import settings, global_vars
 from app.core.context import MediaInfo, Context
 from app.core.meta import MetaBase
@@ -214,22 +216,12 @@ class MessageChain(ChainBase):
 
             # 保存消息
             if not text.startswith("CALLBACK:"):
-                self.messagehelper.put(
-                    CommingMessage(
-                        userid=userid,
-                        username=username,
-                        channel=channel,
-                        source=source,
-                        text=text,
-                    ),
-                    role="user",
-                )
-                self.messageoper.add(
+                self._record_user_message(
                     channel=channel,
                     source=source,
-                    userid=username or userid,
+                    userid=userid,
+                    username=username,
                     text=text,
-                    action=0,
                 )
             # 处理消息
             if text.startswith("CALLBACK:"):
@@ -784,6 +776,26 @@ class MessageChain(ChainBase):
         callback_data = text[9:]  # 去掉 "CALLBACK:" 前缀
         logger.info(f"处理按钮回调：{callback_data}")
 
+        if self._handle_transfer_callback(
+            callback_data=callback_data,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+        ):
+            return
+
+        if self._handle_agent_choice_callback(
+            callback_data=callback_data,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        ):
+            return
+
         # 插件消息的事件回调 [PLUGIN]插件ID|内容
         if callback_data.startswith("[PLUGIN]"):
             # 提取插件ID和内容
@@ -826,6 +838,295 @@ class MessageChain(ChainBase):
                     title="回调数据格式错误，请检查！",
                 )
             )
+
+    @staticmethod
+    def _parse_transfer_callback(
+        callback_data: str,
+    ) -> Optional[tuple[str, int]]:
+        """
+        解析整理失败通知按钮回调。
+        """
+        for prefix, action in (
+            ("transfer_retry_", "retry"),
+            ("transfer_ai_retry_", "ai_retry"),
+        ):
+            if callback_data.startswith(prefix):
+                history_id = callback_data.replace(prefix, "", 1)
+                if history_id.isdigit():
+                    return action, int(history_id)
+        return None
+
+    def _handle_transfer_callback(
+        self,
+        callback_data: str,
+        channel: MessageChannel,
+        source: str,
+        userid: Union[str, int],
+        username: str,
+    ) -> bool:
+        """
+        处理整理失败通知中的重试类按钮。
+        """
+        callback = self._parse_transfer_callback(callback_data)
+        if not callback:
+            return False
+
+        action, history_id = callback
+        if action == "retry":
+            self._retry_transfer_history(
+                history_id=history_id,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+        else:
+            self._take_over_transfer_history_by_ai(
+                history_id=history_id,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+        return True
+
+    @staticmethod
+    def _parse_agent_choice_callback(
+        callback_data: str,
+    ) -> Optional[tuple[str, int]]:
+        """
+        解析 Agent 按钮选择回调。
+        """
+        if callback_data.startswith("agent_interaction:choice:"):
+            try:
+                _, _, request_id, option_index = callback_data.split(":", 3)
+            except ValueError:
+                return None
+        elif callback_data.startswith("agent_choice:"):
+            # 兼容旧格式，避免已发送的按钮失效
+            try:
+                _, request_id, option_index = callback_data.split(":", 2)
+            except ValueError:
+                return None
+        else:
+            return None
+        if not request_id or not option_index.isdigit():
+            return None
+        return request_id, int(option_index)
+
+    def _handle_agent_choice_callback(
+        self,
+        callback_data: str,
+        channel: MessageChannel,
+        source: str,
+        userid: Union[str, int],
+        username: str,
+        original_message_id: Optional[Union[str, int]] = None,
+        original_chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        将 Agent 按钮选择回传为同一会话中的下一条用户消息。
+        """
+        callback = self._parse_agent_choice_callback(callback_data)
+        if not callback:
+            return False
+
+        request_id, option_index = callback
+        resolved = agent_interaction_manager.resolve(
+            request_id=request_id,
+            option_index=option_index,
+            user_id=str(userid),
+        )
+        if not resolved:
+            self.post_message(
+                Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="该选择已失效，请重新发起选择",
+                )
+            )
+            return True
+
+        request, option = resolved
+        selected_text = option.value
+        self._update_interaction_message_feedback(
+            channel=channel,
+            source=source,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+            title=request.title,
+            prompt=request.prompt,
+            selected_label=option.label,
+        )
+        self._bind_session_id(userid, request.session_id)
+        self._record_user_message(
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            text=selected_text,
+        )
+        self._handle_ai_message(
+            text=selected_text,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            session_id=request.session_id,
+        )
+        return True
+
+    def _update_interaction_message_feedback(
+        self,
+        channel: MessageChannel,
+        source: str,
+        original_message_id: Optional[Union[str, int]],
+        original_chat_id: Optional[str],
+        prompt: str,
+        selected_label: str,
+        title: Optional[str] = None,
+    ) -> None:
+        """
+        在用户点击交互按钮后，立即更新原消息，明确显示已选择的内容。
+        """
+        if not original_message_id or not original_chat_id:
+            return
+
+        lines = [prompt.strip()]
+        if selected_label:
+            lines.append(f"已选择：{selected_label}")
+        feedback_text = "\n\n".join(line for line in lines if line)
+        self.edit_message(
+            channel=channel,
+            source=source,
+            message_id=original_message_id,
+            chat_id=original_chat_id,
+            title=title,
+            text=feedback_text,
+        )
+
+    def _retry_transfer_history(
+        self,
+        history_id: int,
+        channel: MessageChannel,
+        source: str,
+        userid: Union[str, int],
+        username: str,
+    ) -> None:
+        """
+        立即重新整理一条失败的整理记录。
+        """
+        self.post_message(
+            Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title=f"开始重新整理记录 #{history_id} ...",
+            )
+        )
+
+        state, errmsg = TransferChain().redo_transfer_history(history_id)
+        if state:
+            self.post_message(
+                Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=f"整理记录 #{history_id} 已重新整理",
+                    link=settings.MP_DOMAIN("#/history"),
+                )
+            )
+            return
+
+        self.post_message(
+            Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="重新整理失败",
+                text=errmsg,
+                link=settings.MP_DOMAIN("#/history"),
+            )
+        )
+
+    def _take_over_transfer_history_by_ai(
+        self,
+        history_id: int,
+        channel: MessageChannel,
+        source: str,
+        userid: Union[str, int],
+        username: str,
+    ) -> None:
+        """
+        由智能助手接管一条失败的整理记录。
+        """
+        if not settings.AI_AGENT_ENABLE:
+            self.post_message(
+                Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="MoviePilot智能助手未启用，请在系统设置中启用",
+                )
+            )
+            return
+
+        self.post_message(
+            Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title=f"已将整理记录 #{history_id} 交给智能助手处理",
+                text="处理完成后会在这里回复结果。",
+                link=settings.MP_DOMAIN("#/history"),
+            )
+        )
+
+        async def _run_ai_takeover():
+            final_output = ""
+
+            def _capture_output(text_output: str):
+                nonlocal final_output
+                final_output = text_output or ""
+
+            try:
+                await agent_manager.manual_redo_transfer(
+                    history_id=history_id,
+                    output_callback=_capture_output,
+                )
+                await self.async_post_message(
+                    Notification(
+                        channel=channel,
+                        source=source,
+                        userid=userid,
+                        username=username,
+                        title="智能助手整理完成",
+                        text=final_output.strip()
+                        or f"整理记录 #{history_id} 已由智能助手处理完成。",
+                        link=settings.MP_DOMAIN("#/history"),
+                    )
+                )
+            except Exception as e:
+                await self.async_post_message(
+                    Notification(
+                        channel=channel,
+                        source=source,
+                        userid=userid,
+                        username=username,
+                        title="智能助手整理失败",
+                        text=str(e),
+                        link=settings.MP_DOMAIN("#/history"),
+                    )
+                )
+
+        asyncio.run_coroutine_threadsafe(_run_ai_takeover(), global_vars.loop)
 
     def __auto_download(
         self,
@@ -1126,6 +1427,41 @@ class MessageChain(ChainBase):
         logger.info(f"创建新会话ID: {new_session_id}, 用户: {userid}")
         return new_session_id
 
+    def _bind_session_id(self, userid: Union[str, int], session_id: str) -> None:
+        """
+        将用户会话绑定到指定的 session_id，并刷新最后活动时间。
+        """
+        self._user_sessions[userid] = (session_id, datetime.now())
+
+    def _record_user_message(
+        self,
+        channel: MessageChannel,
+        source: str,
+        userid: Union[str, int],
+        username: str,
+        text: str,
+    ) -> None:
+        """
+        保存一条用户消息到消息历史与数据库。
+        """
+        self.messagehelper.put(
+            CommingMessage(
+                userid=userid,
+                username=username,
+                channel=channel,
+                source=source,
+                text=text,
+            ),
+            role="user",
+        )
+        self.messageoper.add(
+            channel=channel,
+            source=source,
+            userid=username or userid,
+            text=text,
+            action=0,
+        )
+
     def clear_user_session(self, userid: Union[str, int]) -> bool:
         """
         清除指定用户的会话信息
@@ -1245,6 +1581,7 @@ class MessageChain(ChainBase):
         images: Optional[List[CommingMessage.MessageImage]] = None,
         files: Optional[List[CommingMessage.MessageAttachment]] = None,
         reply_with_voice: bool = False,
+        session_id: Optional[str] = None,
     ) -> None:
         """
         处理AI智能体消息
@@ -1284,7 +1621,8 @@ class MessageChain(ChainBase):
                 return
 
             # 生成或复用会话ID
-            session_id = self._get_or_create_session_id(userid)
+            session_id = session_id or self._get_or_create_session_id(userid)
+            self._bind_session_id(userid, session_id)
 
             # 下载图片并转为base64
             original_images = images
