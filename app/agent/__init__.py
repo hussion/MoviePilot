@@ -169,7 +169,6 @@ class MoviePilotAgent:
         self.channel = channel
         self.source = source
         self.username = username
-        self.reply_with_voice = False
         self._tool_context: Dict[str, object] = {}
         self.output_callback: Optional[Callable[[str], None]] = None
         self.force_streaming = False
@@ -279,8 +278,6 @@ class MoviePilotAgent:
         """
         if self.is_background:
             return self.force_streaming or callable(self.output_callback)
-        if self.reply_with_voice:
-            return False
         if self.force_streaming or callable(self.output_callback):
             return True
         # 啰嗦模式下始终需要流式输出来捕获工具调用前的 Agent 文字
@@ -378,10 +375,7 @@ class MoviePilotAgent:
         """
         try:
             # 系统提示词
-            system_prompt = prompt_manager.get_agent_prompt(
-                channel=self.channel,
-                prefer_voice_reply=self.reply_with_voice,
-            )
+            system_prompt = prompt_manager.get_agent_prompt(channel=self.channel)
 
             # LLM 模型（用于 agent 执行）
             llm = self._initialize_llm(streaming=streaming)
@@ -459,7 +453,6 @@ class MoviePilotAgent:
                 f"images={len(images) if images else 0}, files={len(files) if files else 0}"
             )
             self._tool_context = {
-                "incoming_voice": self.reply_with_voice,
                 "user_reply_sent": False,
                 "reply_mode": None,
             }
@@ -730,7 +723,6 @@ class _MessageTask:
     channel: Optional[str] = None
     source: Optional[str] = None
     username: Optional[str] = None
-    reply_with_voice: bool = False
 
 
 class AgentManager:
@@ -828,7 +820,6 @@ class AgentManager:
         channel: str = None,
         source: str = None,
         username: str = None,
-        reply_with_voice: bool = False,
     ) -> str:
         """
         处理用户消息：将消息放入会话队列，按顺序依次处理。
@@ -843,7 +834,6 @@ class AgentManager:
             channel=channel,
             source=source,
             username=username,
-            reply_with_voice=reply_with_voice,
         )
 
         # 获取或创建会话队列
@@ -941,7 +931,6 @@ class AgentManager:
                 agent.source = task.source
             if task.username:
                 agent.username = task.username
-        agent.reply_with_voice = task.reply_with_voice
 
         return await agent.process(task.message, images=task.images, files=task.files)
 
