@@ -1,17 +1,108 @@
 """MoviePilot 自定义工具筛选中间件。"""
-
-from __future__ import annotations
-
 import json
-from typing import Any
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal, Union, NotRequired
 
-from langchain.agents.middleware import LLMToolSelectorMiddleware
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    AgentState,
+    ContextT,
+    ModelRequest,
+    ModelResponse,
+    ResponseT,
+)
+from langchain.agents.middleware.types import (
+    PrivateStateAttr,  # noqa
+)
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
+from langgraph.runtime import Runtime
+from pydantic import Field, TypeAdapter
+from typing_extensions import TypedDict  # noqa
 
 from app.log import logger
 
+DEFAULT_SYSTEM_PROMPT = (
+    "Your goal is to select the most relevant tools for answering the user's query."
+)
 
-class MoviePilotToolSelectorMiddleware(LLMToolSelectorMiddleware):
+
+@dataclass
+class _SelectionRequest:
+    """Prepared inputs for tool selection."""
+
+    available_tools: list[BaseTool]
+    system_message: str
+    last_user_message: HumanMessage
+    model: BaseChatModel
+    valid_tool_names: list[str]
+
+
+def _create_tool_selection_response(tools: list[BaseTool]) -> TypeAdapter[Any]:
+    """Create a structured output schema for tool selection.
+
+    Args:
+        tools: Available tools to include in the schema.
+
+    Returns:
+        `TypeAdapter` for a schema where each tool name is a `Literal` with its
+            description.
+
+    Raises:
+        AssertionError: If `tools` is empty.
+    """
+    if not tools:
+        msg = "Invalid usage: tools must be non-empty"
+        raise AssertionError(msg)
+
+    # Create a Union of Annotated Literal types for each tool name with description
+    # For instance: Union[Annotated[Literal["tool1"], Field(description="...")], ...]
+    literals = [
+        Annotated[Literal[tool.name], Field(description=tool.description)] for tool in tools  # noqa
+    ]
+    selected_tool_type = Union[tuple(literals)]  # type: ignore[valid-type]  # noqa: UP007
+
+    description = "Tools to use. Place the most relevant tools first."
+
+    class ToolSelectionResponse(TypedDict):
+        """Use to select relevant tools."""
+
+        tools: Annotated[list[selected_tool_type], Field(description=description)]  # type: ignore[valid-type]
+
+    return TypeAdapter(ToolSelectionResponse)
+
+
+def _render_tool_list(tools: list[BaseTool]) -> str:
+    """Format tools as markdown list.
+
+    Args:
+        tools: Tools to format.
+
+    Returns:
+        Markdown string with each tool on a new line.
+    """
+    return "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
+
+
+class ToolSelectionState(AgentState):
+    """工具筛选中间件私有状态。"""
+
+    selected_tool_names: NotRequired[
+        Annotated[list[str] | None, PrivateStateAttr]
+    ]
+    """当前这条用户请求首轮筛选得到的工具名列表。"""
+
+
+class ToolSelectionStateUpdate(TypedDict):
+    """工具筛选中间件状态更新项。"""
+
+    selected_tool_names: list[str] | None
+
+
+class ToolSelectorMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, ResponseT]):
     """
     为 DeepSeek 兼容端点提供更稳妥的工具筛选实现。
 
@@ -24,7 +115,144 @@ class MoviePilotToolSelectorMiddleware(LLMToolSelectorMiddleware):
     1. 使用 `response_format={"type": "json_object"}`；
     2. 在提示词中明确约束返回 JSON 结构；
     3. 手动解析 `{"tools": [...]}`，其余模型继续沿用 LangChain 默认实现。
+
+    另外，LangChain 原生工具筛选挂在 `wrap_model_call` 上，会在同一条用户请求
+    的每次“模型回合”前都重新筛选一次工具。对于会多轮调用工具的复杂任务，
+    这会重复消耗一次额外的 LLM 调用。这里改成：
+    - `abefore_agent()`：在本轮 Agent 执行开始时筛选一次；
+    - `awrap_model_call()`：从 `request.state` 读取首轮筛选结果并复用。
     """
+
+    state_schema = ToolSelectionState
+
+    def __init__(self,
+                 model: BaseChatModel,
+                 system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+                 selection_tools: list[Any] | None = None,
+                 max_tools: int | None = None,
+                 always_include: list[str] | None = None, ) -> None:
+        super().__init__()
+        self.model = model
+        self.system_prompt = system_prompt
+        self.max_tools = max_tools
+        self.always_include = always_include or []
+        self.selection_tools = selection_tools or []
+
+    def _prepare_selection_request(
+            self, request: ModelRequest[ContextT]
+    ) -> _SelectionRequest | None:
+        """Prepare inputs for tool selection.
+
+        Args:
+            request: the model request.
+
+        Returns:
+            `SelectionRequest` with prepared inputs, or `None` if no selection is
+            needed.
+
+        Raises:
+            ValueError: If tools in `always_include` are not found in the request.
+            AssertionError: If no user message is found in the request messages.
+        """
+        # If no tools available, return None
+        if not request.tools or len(request.tools) == 0:
+            return None
+
+        # Filter to only BaseTool instances (exclude provider-specific tool dicts)
+        base_tools = [tool for tool in request.tools if not isinstance(tool, dict)]
+
+        # Validate that always_include tools exist
+        if self.always_include:
+            available_tool_names = {tool.name for tool in base_tools}
+            missing_tools = [
+                name for name in self.always_include if name not in available_tool_names
+            ]
+            if missing_tools:
+                msg = (
+                    f"Tools in always_include not found in request: {missing_tools}. "
+                    f"Available tools: {sorted(available_tool_names)}"
+                )
+                raise ValueError(msg)
+
+        # Separate tools that are always included from those available for selection
+        available_tools = [tool for tool in base_tools if tool.name not in self.always_include]
+
+        # If no tools available for selection, return None
+        if not available_tools:
+            return None
+
+        system_message = self.system_prompt
+        # If there's a max_tools limit, append instructions to the system prompt
+        if self.max_tools is not None:
+            system_message += (
+                f"\nIMPORTANT: List the tool names in order of relevance, "
+                f"with the most relevant first. "
+                f"If you exceed the maximum number of tools, "
+                f"only the first {self.max_tools} will be used."
+            )
+
+        # Get the last user message from the conversation history
+        last_user_message: HumanMessage
+        for message in reversed(request.messages):
+            if isinstance(message, HumanMessage):
+                last_user_message = message
+                break
+        else:
+            msg = "No user message found in request messages"
+            raise AssertionError(msg)
+
+        model = self.model or request.model
+        valid_tool_names = [tool.name for tool in available_tools]
+
+        return _SelectionRequest(
+            available_tools=available_tools,
+            system_message=system_message,
+            last_user_message=last_user_message,
+            model=model,
+            valid_tool_names=valid_tool_names,
+        )
+
+    def _process_selection_response(
+            self,
+            response: dict[str, Any],
+            available_tools: list[BaseTool],
+            valid_tool_names: list[str],
+            request: ModelRequest[ContextT],
+    ) -> ModelRequest[ContextT]:
+        """Process the selection response and return filtered `ModelRequest`."""
+        selected_tool_names: list[str] = []
+        invalid_tool_selections = []
+
+        for tool_name in response["tools"]:
+            if tool_name not in valid_tool_names:
+                invalid_tool_selections.append(tool_name)
+                continue
+
+            # Only add if not already selected and within max_tools limit
+            if tool_name not in selected_tool_names and (
+                    self.max_tools is None or len(selected_tool_names) < self.max_tools
+            ):
+                selected_tool_names.append(tool_name)
+
+        if invalid_tool_selections:
+            msg = f"Model selected invalid tools: {invalid_tool_selections}"
+            raise ValueError(msg)
+
+        # Filter tools based on selection and append always-included tools
+        selected_tools: list[BaseTool] = [
+            tool for tool in available_tools if tool.name in selected_tool_names
+        ]
+        always_included_tools: list[BaseTool] = [
+            tool
+            for tool in request.tools
+            if not isinstance(tool, dict) and tool.name in self.always_include
+        ]
+        selected_tools.extend(always_included_tools)
+
+        # Also preserve any provider-specific tool dicts from the original request
+        provider_tools = [tool for tool in request.tools if isinstance(tool, dict)]
+
+        return request.override(tools=[*selected_tools, *provider_tools])
 
     @staticmethod
     def _is_deepseek_compatible_model(model: BaseChatModel) -> bool:
@@ -175,22 +403,125 @@ class MoviePilotToolSelectorMiddleware(LLMToolSelectorMiddleware):
         )
         return self._normalize_selection_response(response)
 
-    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+    @staticmethod
+    def _extract_selected_tool_names(request: ModelRequest) -> list[str]:
+        """从已筛选后的请求中提取最终工具名，保留原有顺序。"""
+        return [
+            tool.name for tool in request.tools if not isinstance(tool, dict)
+        ]
+
+    @staticmethod
+    def _apply_selected_tools(
+            request: ModelRequest[ContextT],
+            selected_tool_names: list[str],
+    ) -> ModelRequest[ContextT]:
         """
-        异步版本的 DeepSeek 工具筛选兼容分支。
+        将已筛选出的工具集应用到当前模型请求。
+
+        这里只复用首次筛选出的客户端工具名；provider-specific 的 dict 工具仍然
+        原样保留，避免破坏 LangChain/provider 自身的工具绑定约定。
+        """
+        if not selected_tool_names:
+            return request
+
+        current_tools_by_name = {
+            tool.name: tool
+            for tool in request.tools
+            if not isinstance(tool, dict)
+        }
+        selected_tools = [
+            current_tools_by_name[tool_name]
+            for tool_name in selected_tool_names
+            if tool_name in current_tools_by_name
+        ]
+        provider_tools = [tool for tool in request.tools if isinstance(tool, dict)]
+        return request.override(tools=[*selected_tools, *provider_tools])
+
+    async def _aselect_request_once(
+            self, request: ModelRequest[ContextT]
+    ) -> ModelRequest[ContextT]:
+        """
+        执行一次真实工具筛选，并返回筛选后的请求对象。
+
+        这里单独抽成 helper，便于首次筛选后缓存结果，也便于测试覆盖
+        “首轮筛选，后续复用”的行为。
         """
         selection_request = self._prepare_selection_request(request)
         if selection_request is None:
-            return await handler(request)
+            return request
 
         if not self._is_deepseek_compatible_model(selection_request.model):
-            return await super().awrap_model_call(request, handler)
+            captured_request: ModelRequest[ContextT] = request
+
+            async def _capture_handler(
+                    updated_request: ModelRequest[ContextT],
+            ) -> ModelRequest[ContextT]:
+                nonlocal captured_request
+                captured_request = updated_request
+                return updated_request
+
+            await super().awrap_model_call(request, _capture_handler)
+            return captured_request
 
         response = await self._aselect_tools_with_deepseek(selection_request)
-        modified_request = self._process_selection_response(
+        return self._process_selection_response(
             response,
             selection_request.available_tools,
             selection_request.valid_tool_names,
             request,
         )
-        return await handler(modified_request)
+
+    async def abefore_agent(  # noqa
+            self,
+            state: ToolSelectionState,
+            runtime: Runtime,  # noqa
+            config: RunnableConfig,
+    ) -> ToolSelectionStateUpdate | None:  # ty: ignore[invalid-method-override]
+        """
+        在本轮 Agent 执行开始前完成一次真实工具筛选。
+
+        这样后续多轮 `model -> tools -> model` 循环都只复用这一次结果，
+        不会为每次模型回合重复追加一笔 selector LLM 开销。
+        """
+        if "selected_tool_names" in state:
+            return None
+
+        if not self.selection_tools or self.model is None:
+            return ToolSelectionStateUpdate(selected_tool_names=None)
+
+        selection_request = ModelRequest(
+            model=self.model,
+            tools=list(self.selection_tools),
+            messages=state["messages"],
+            state=state,
+            runtime=runtime,
+        )
+        modified_request = await self._aselect_request_once(selection_request)
+        selected_tool_names = self._extract_selected_tool_names(modified_request)
+        return ToolSelectionStateUpdate(
+            selected_tool_names=selected_tool_names or None
+        )
+
+    async def awrap_model_call(
+            self,
+            request: ModelRequest[ContextT],
+            handler: Callable[
+                [ModelRequest[ContextT]], Awaitable[ModelResponse[ResponseT]]
+            ],
+    ) -> ModelResponse[ResponseT]:
+        """
+        从 state 中读取首次筛选结果，并应用到每次模型回合。
+        """
+        selected_tool_names = request.state.get("selected_tool_names")  # noqa
+
+        # 正常路径下，`abefore_agent()` 已经提前写入状态；这里只保留一层兜底，
+        # 兼容直接单测或未来某些绕过 before_agent 的调用场景。
+        if selected_tool_names is None and self.selection_tools and self.model is not None:
+            request = await self._aselect_request_once(request)
+            selected_tool_names = self._extract_selected_tool_names(request) or None
+            request.state["selected_tool_names"] = selected_tool_names  # noqa
+
+        if selected_tool_names:
+            request = self._apply_selected_tools(request, selected_tool_names)
+
+        return await handler(request)
