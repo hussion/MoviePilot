@@ -16,6 +16,14 @@ from app.agent.tools.impl.test_site import TestSiteTool
 from app.agent.tools.impl.query_subscribes import QuerySubscribesTool
 from app.agent.tools.impl.query_subscribe_shares import QuerySubscribeSharesTool
 from app.agent.tools.impl.query_rule_groups import QueryRuleGroupsTool
+from app.agent.tools.impl.query_builtin_filter_rules import QueryBuiltinFilterRulesTool
+from app.agent.tools.impl.query_custom_filter_rules import QueryCustomFilterRulesTool
+from app.agent.tools.impl.add_custom_filter_rule import AddCustomFilterRuleTool
+from app.agent.tools.impl.update_custom_filter_rule import UpdateCustomFilterRuleTool
+from app.agent.tools.impl.delete_custom_filter_rule import DeleteCustomFilterRuleTool
+from app.agent.tools.impl.add_rule_group import AddRuleGroupTool
+from app.agent.tools.impl.update_rule_group import UpdateRuleGroupTool
+from app.agent.tools.impl.delete_rule_group import DeleteRuleGroupTool
 from app.agent.tools.impl.query_popular_subscribes import QueryPopularSubscribesTool
 from app.agent.tools.impl.query_subscribe_history import QuerySubscribeHistoryTool
 from app.agent.tools.impl.delete_subscribe import DeleteSubscribeTool
@@ -79,6 +87,18 @@ class MoviePilotToolFactory:
     MoviePilot工具工厂
     """
 
+    # 这些通用工具需要始终保留，避免大工具集裁剪后让 Agent 丢失基础的
+    # 文件系统、命令执行或交互确认能力。AskUserChoiceTool 仅在支持按钮
+    # 的渠道中才会实际注入，因此后续会再按已加载工具做一次求交集。
+    TOOL_SELECTOR_ALWAYS_INCLUDE_NAMES = (
+        "list_directory",
+        "write_file",
+        "read_file",
+        "edit_file",
+        "execute_command",
+        "ask_user_choice",
+    )
+
     @staticmethod
     def _should_enable_choice_tool(channel: str = None) -> bool:
         if not channel:
@@ -90,6 +110,25 @@ class MoviePilotToolFactory:
         return ChannelCapabilityManager.supports_buttons(
             message_channel
         ) and ChannelCapabilityManager.supports_callbacks(message_channel)
+
+    @classmethod
+    def get_tool_selector_always_include_names(
+        cls, tools: List[MoviePilotTool]
+    ) -> List[str]:
+        """
+        返回当前实际已加载且需要绕过工具筛选的工具名。
+
+        `LLMToolSelectorMiddleware` 会校验 `always_include` 中的工具名是否
+        存在于当前请求里，因此这里必须根据运行时工具列表做交集过滤。
+        """
+        available_tool_names = {
+            tool.name for tool in tools if getattr(tool, "name", None)
+        }
+        return [
+            tool_name
+            for tool_name in cls.TOOL_SELECTOR_ALWAYS_INCLUDE_NAMES
+            if tool_name in available_tool_names
+        ]
 
     @staticmethod
     def create_tools(
@@ -124,7 +163,15 @@ class MoviePilotToolFactory:
             QuerySubscribesTool,
             QuerySubscribeSharesTool,
             QueryPopularSubscribesTool,
+            QueryBuiltinFilterRulesTool,
+            QueryCustomFilterRulesTool,
             QueryRuleGroupsTool,
+            AddCustomFilterRuleTool,
+            UpdateCustomFilterRuleTool,
+            DeleteCustomFilterRuleTool,
+            AddRuleGroupTool,
+            UpdateRuleGroupTool,
+            DeleteRuleGroupTool,
             QuerySubscribeHistoryTool,
             DeleteSubscribeTool,
             QueryDownloadTasksTool,
