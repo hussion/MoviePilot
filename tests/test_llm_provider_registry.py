@@ -210,6 +210,47 @@ class LlmProviderRegistryTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in models], ["frog-1"])
         self.assertEqual(models[0]["source"], "models.dev")
 
+    def test_get_models_dev_data_falls_back_to_bundled_file_when_fetch_and_cache_fail(self):
+        manager = LLMProviderManager()
+        payload = {
+            "frogbot": {
+                "id": "frogbot",
+                "name": "FrogBot",
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {},
+            }
+        }
+
+        with patch.object(manager, "_fetch_models_dev", AsyncMock(side_effect=RuntimeError("offline"))), patch.object(
+            manager, "_load_models_dev_from_disk", AsyncMock(return_value=None)
+        ), patch.object(manager, "_load_bundled_models_dev_payload", return_value=payload):
+            data = asyncio.run(manager.get_models_dev_data(force_refresh=True))
+
+        self.assertEqual(data, payload)
+        self.assertEqual(manager._models_dev_data, payload)
+
+    def test_cached_models_dev_payload_falls_back_to_bundled_file(self):
+        manager = LLMProviderManager()
+        payload = {
+            "frogbot": {
+                "id": "frogbot",
+                "name": "FrogBot",
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://app.frogbot.ai/api/v1",
+                "models": {},
+            }
+        }
+
+        missing_cache_path = Path(f"/tmp/llm-provider-cache-missing-{id(manager)}.json")
+
+        with patch.object(manager, "_models_dev_cache_path", missing_cache_path), patch.object(
+            manager, "_load_bundled_models_dev_payload", return_value=payload
+        ):
+            provider = manager.get_provider("frogbot")
+
+        self.assertEqual(provider.id, "frogbot")
+        self.assertEqual(provider.default_base_url, "https://app.frogbot.ai/api/v1")
+
     def test_builtin_provider_includes_baidu_qianfan_base_url_presets(self):
         manager = LLMProviderManager()
 
@@ -293,6 +334,107 @@ class LlmProviderRegistryTest(unittest.TestCase):
             ),
             "minimax-cn-coding-plan",
         )
+
+    def test_builtin_moonshot_provider_includes_kimi_for_coding_preset(self):
+        manager = LLMProviderManager()
+
+        provider = manager.get_provider("moonshot")
+        serialized = manager.list_providers()
+        moonshot_payload = next(item for item in serialized if item["id"] == "moonshot")
+
+        self.assertEqual(provider.name, "Moonshot / Kimi")
+        self.assertEqual(provider.runtime, "openai_compatible")
+        self.assertEqual(
+            tuple((preset.id, preset.label, preset.value, preset.runtime) for preset in provider.base_url_presets),
+            (
+                ("moonshot-cn", "中国站", "https://api.moonshot.cn/v1", None),
+                ("moonshot-global", "国际站", "https://api.moonshot.ai/v1", None),
+                (
+                    "moonshot-kimi-coding",
+                    "Kimi for Coding",
+                    "https://api.kimi.com/coding/v1",
+                    "anthropic_compatible",
+                ),
+            ),
+        )
+        self.assertEqual(
+            tuple(item["id"] for item in moonshot_payload["base_url_presets"]),
+            ("moonshot-cn", "moonshot-global", "moonshot-kimi-coding"),
+        )
+
+    def test_kimi_coding_alias_resolves_to_moonshot_provider(self):
+        manager = LLMProviderManager()
+
+        provider = manager.get_provider("kimi-coding")
+
+        self.assertEqual(provider.id, "moonshot")
+
+    def test_resolve_runtime_prefers_kimi_for_coding_preset_runtime(self):
+        manager = LLMProviderManager()
+
+        runtime = asyncio.run(
+            manager.resolve_runtime(
+                provider_id="moonshot",
+                model=None,
+                api_key="sk-test",
+                base_url="https://api.kimi.com/coding/v1",
+                base_url_preset_id="moonshot-kimi-coding",
+            )
+        )
+
+        self.assertEqual(runtime["provider_id"], "moonshot")
+        self.assertEqual(runtime["runtime"], "anthropic_compatible")
+        self.assertEqual(runtime["base_url"], "https://api.kimi.com/coding")
+
+    def test_resolve_model_list_strategy_prefers_kimi_for_coding_preset(self):
+        manager = LLMProviderManager()
+        provider = manager.get_provider("moonshot")
+
+        self.assertEqual(
+            manager._resolve_provider_model_list_strategy(
+                provider,
+                base_url="https://api.kimi.com/coding/v1",
+                base_url_preset_id="moonshot-kimi-coding",
+            ),
+            "anthropic_compatible",
+        )
+
+    def test_chatgpt_oauth_models_follow_models_dev_catalog(self):
+        manager = LLMProviderManager()
+        payload = {
+            "openai": {
+                "id": "openai",
+                "name": "OpenAI",
+                "models": {
+                    "gpt-5.5": {
+                        "name": "GPT-5.5",
+                        "limit": {"context": 400000},
+                    },
+                    "o4-mini": {
+                        "name": "o4-mini",
+                        "limit": {"context": 200000},
+                    },
+                },
+            }
+        }
+
+        with patch.object(manager, "get_models_dev_data", AsyncMock(return_value=payload)):
+            models = asyncio.run(
+                manager._list_chatgpt_oauth_models(provider_id="chatgpt")
+            )
+
+        self.assertEqual([item["id"] for item in models], ["gpt-5.5", "o4-mini"])
+        self.assertTrue(all(item["source"] == "models.dev" for item in models))
+
+    def test_chatgpt_oauth_models_return_empty_when_catalog_missing(self):
+        manager = LLMProviderManager()
+
+        with patch.object(manager, "get_models_dev_data", AsyncMock(return_value={})):
+            models = asyncio.run(
+                manager._list_chatgpt_oauth_models(provider_id="chatgpt")
+            )
+
+        self.assertEqual(models, [])
 
 
 if __name__ == "__main__":
