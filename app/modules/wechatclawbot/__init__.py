@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from app.core.cache import TTLCache
 from app.core.context import Context, MediaInfo
@@ -31,6 +31,7 @@ class WechatClawBotModule(_ModuleBase, _MessageBase[WechatClawBot]):
 
     @staticmethod
     def get_name() -> str:
+        """获取模块名称。"""
         return "微信 ClawBot"
 
     @staticmethod
@@ -68,10 +69,12 @@ class WechatClawBotModule(_ModuleBase, _MessageBase[WechatClawBot]):
         return True, ""
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
+        """初始化模块设置。"""
         pass
 
     @staticmethod
     def _load_json(body: Any) -> Optional[dict]:
+        """将内容解析为 JSON 字典。"""
         if isinstance(body, dict):
             payload = body
         elif isinstance(body, bytes):
@@ -84,6 +87,7 @@ class WechatClawBotModule(_ModuleBase, _MessageBase[WechatClawBot]):
 
     @staticmethod
     def _normalize_audio_refs(audio_refs: Any) -> Optional[List[str]]:
+        """标准化音频引用列表。"""
         if not audio_refs:
             return None
         if not isinstance(audio_refs, list):
@@ -93,6 +97,7 @@ class WechatClawBotModule(_ModuleBase, _MessageBase[WechatClawBot]):
 
     @staticmethod
     def _normalize_files(files: Any) -> Optional[List[CommingMessage.MessageAttachment]]:
+        """标准化文件附件列表。"""
         if not files:
             return None
         if not isinstance(files, list):
@@ -290,7 +295,3 @@ class WechatClawBotModule(_ModuleBase, _MessageBase[WechatClawBot]):
                     title=message.title,
                     link=message.link,
                 )
-
-    def register_commands(self, commands: Dict[str, dict]):
-        """微信 ClawBot 不支持原生菜单命令，统一走文本交互。"""
-        logger.debug("微信 ClawBot 不支持原生菜单命令，跳过命令注册")
