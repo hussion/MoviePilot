@@ -123,7 +123,13 @@ class ZSpace:
 
     def get_library_folders(self) -> List[dict]:
         """
-        获取极影视媒体库路径列表
+        获取极影视媒体库路径列表。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）未实现 `Library/SelectableMediaFolders`
+        （实测 404）。此处先尝试标准端点；不可用时退化为 `Users/{uid}/Views`
+        的返回（仅有 Id/Name，**没有 SubFolders/Path**）——下游按子目录路径
+        匹配库 ID 的逻辑在该服务端上无法工作，会回退到整库刷新分支。
         """
         if not self._host or not self._apikey:
             return []
@@ -132,16 +138,21 @@ class ZSpace:
             res = self.__request_utils().get_res(url)
             if res:
                 return res.json()
-            else:
-                logger.error("Library/SelectableMediaFolders 未获取到返回数据")
-                return []
+            logger.debug("Library/SelectableMediaFolders 未获取到返回数据，回退到 Users/{uid}/Views")
         except Exception as e:
-            logger.error(f"连接Library/SelectableMediaFolders 出错：{e}")
-            return []
+            logger.debug(f"连接Library/SelectableMediaFolders 出错：{e}，回退到 Users/{{uid}}/Views")
+        return self.__get_library_views() or []
 
     def get_virtual_folders(self) -> List[dict]:
         """
-        获取极影视媒体库所有路径列表（包含共享路径）
+        获取极影视媒体库所有路径列表（包含共享路径）。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）未实现 `Library/VirtualFolders/Query`
+        （实测 404），且 `Users/{uid}/Views` 与 `Users/{uid}/Items` 返回里
+        `Path` 均为空字符串，因此该端点不可用时仅能给出"库 Id/Name + 空路径
+        列表"。下游 `get_user_library_folders()` 会跳过空 Path 的库，等价于
+        对所有库都不做路径前缀过滤——这是当前可用的最小可工作策略。
         """
         if not self._host or not self._apikey:
             return []
@@ -169,12 +180,20 @@ class ZSpace:
                             'Path': library_paths
                         })
                 return libraries
-            else:
-                logger.error("Library/VirtualFolders/Query 未获取到返回数据")
-                return []
+            logger.debug("Library/VirtualFolders/Query 未获取到返回数据，回退到 Users/{uid}/Views（路径列表为空）")
         except Exception as e:
-            logger.error(f"连接Library/VirtualFolders/Query 出错：{e}")
-            return []
+            logger.debug(f"连接Library/VirtualFolders/Query 出错：{e}，回退到 Users/{{uid}}/Views（路径列表为空）")
+        libraries = []
+        for view in self.__get_library_views() or []:
+            view_id = view.get("Id")
+            view_name = view.get("Name")
+            if view_id and view_name:
+                libraries.append({
+                    'Id': view_id,
+                    'Name': view_name,
+                    'Path': []
+                })
+        return libraries
 
     def __get_library_views(self, username: Optional[str] = None) -> List[dict]:
         """
@@ -237,6 +256,11 @@ class ZSpace:
     def get_user(self, user_name: Optional[str] = None) -> Optional[Union[str, int]]:
         """
         获取可用用户ID，优先按用户名匹配，失败时回退当前登录用户。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）暂未实现 `Users` 全量列表端点（实测 404），
+        所以多用户名匹配在该服务端不可用；这里按"端点可用→按名匹配 / 端点不可用→
+        当前登录用户兜底"的顺序处理，避免主日志反复刷 ERROR。
         """
         if not self._host or not self._apikey:
             return None
@@ -257,11 +281,12 @@ class ZSpace:
                         if user.get("Id"):
                             return user.get("Id")
                 else:
-                    logger.error("Users 返回数据格式错误")
+                    logger.debug("Users 返回数据格式错误，回退到当前登录用户")
             else:
-                logger.error("Users 未获取到返回数据")
+                # 极影视未实现该端点会走到这里，仅 debug 级即可，避免污染主日志
+                logger.debug("Users 未获取到返回数据，可能服务端未实现该端点，回退到当前登录用户")
         except Exception as e:
-            logger.error(f"连接Users出错：{e}")
+            logger.debug(f"连接Users出错：{e}，回退到当前登录用户")
         return self.__get_current_user_id() or self.user
 
     def authenticate(self, username: str, password: str) -> Optional[str]:
@@ -295,7 +320,12 @@ class ZSpace:
 
     def get_user_count(self) -> int:
         """
-        获得用户数量
+        获得用户数量。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）的 `Users/Query` 端点会把路径段 "Query"
+        当作 mediaUid 校验，返回 400 "invalid mediaUid format"；此时无法
+        从服务端拿到真实用户数，退化为：已登录则至少有 1 个用户。
         """
         if not self._host or not self._apikey:
             return 0
@@ -307,15 +337,35 @@ class ZSpace:
                 if count:
                     return count
             else:
-                logger.error("Users/Query 未获取到返回数据")
+                # 极影视未实现该端点会走到这里，降为 debug 避免主日志误报
+                logger.debug("Users/Query 未获取到返回数据，可能服务端未实现该端点，回退到登录用户兜底")
         except Exception as e:
-            logger.error(f"连接Users/Query出错：{e}")
+            logger.debug(f"连接Users/Query出错：{e}，回退到登录用户兜底")
         return 1 if self.user else 0
 
     def get_medias_count(self) -> schemas.Statistic:
         """
-        获得电影、电视剧、动漫媒体数量
-        :return: MovieCount SeriesCount SongCount
+        获得电影、电视剧、动漫媒体数量。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）相关接口实测：
+        - `Items/Counts` → 401 "无权限"；`Users/{uid}/Items/Counts` → 500，
+          两条标准聚合路径都拿不到全局统计。
+        - `Users/{uid}/Items` 的 `IncludeItemTypes` 参数：
+          - 在带 `ParentId` 时**完全被忽略**（同一库无论传 Movie/Series/
+            Episode/Folder/Audio，TotalRecordCount 都等于该库总条数）。
+          - 在不带 `ParentId` 的全局层面，单类型 `Movie` / `Series` 过滤
+            生效；`Episode` 与多类型逗号组合（如 `Movie,Series`）不生效。
+        - Views 返回的 `CollectionType` 在该服务端恒为 null，无法直接
+          区分库类型。
+        因为还要遵循 `_sync_libraries` 选中过滤，不能用"两次全局过滤请求"
+        的简化方案（全局聚合无 ParentId 入参）。降级流程：
+        1. 先尝试标准 `Items/Counts`；
+        2. 失败则遍历**被选中**的媒体库视图，按 `Users/{uid}/Items
+           ?ParentId=...&Limit=0` 拿单库 TotalRecordCount，再通过
+           `Limit=1` 采样首条目 `Type` 兜底分桶到 movie / tv；
+        3. 集数维度在该服务端无法可靠拿到，统一计 0。
+        :return: MovieCount SeriesCount EpisodeCount
         """
         if not self._host or not self._apikey:
             return schemas.Statistic()
@@ -329,12 +379,88 @@ class ZSpace:
                     tv_count=result.get("SeriesCount") or 0,
                     episode_count=result.get("EpisodeCount") or 0
                 )
-            else:
-                logger.error("Items/Counts 未获取到返回数据")
-                return schemas.Statistic()
+            logger.debug("Items/Counts 未获取到返回数据，回退到按媒体库累计 TotalRecordCount")
         except Exception as e:
-            logger.error(f"连接Items/Counts出错：{e}")
+            logger.debug(f"连接Items/Counts出错：{e}，回退到按媒体库累计 TotalRecordCount")
+        return self.__count_medias_by_views()
+
+    def __count_medias_by_views(self) -> schemas.Statistic:
+        """
+        通过遍历媒体库视图累计条目数，兜底实现 `get_medias_count`。
+
+        - 仅统计 `_sync_libraries` 选中的库；空集或包含 `"all"` 时视为
+          全部，与 `get_librarys` / `get_user_library_folders` 的过滤语义
+          保持一致。
+        - 对每个被选中的 View 调 `Users/{uid}/Items?ParentId=<libId>
+          &Recursive=true&Limit=0` 只拿 `TotalRecordCount`，再按视图类型
+          分桶到 movie / tv。极影视当前 Emby 兼容层返回的 View 中
+          `CollectionType` 恒为 null，无法直接判定库类型，因此优先用
+          `CollectionType`；缺失时用 `Limit=1` 采样一条目，按返回条目的
+          `Type`（Movie / Series / Episode）兜底分类。
+        - 集数维度在该服务端无法可靠拿到（见 `get_medias_count` 注释），
+          统一计为 0。
+        """
+        if not self._host or not self._apikey or not self.user:
             return schemas.Statistic()
+        # 与 get_librarys / get_user_library_folders 保持一致的选中库过滤：
+        # _sync_libraries 为空或包含 "all" 视为全部库。
+        sync_all = (not self._sync_libraries) or ("all" in self._sync_libraries)
+        stat = schemas.Statistic()
+        for view in self.__get_library_views() or []:
+            view_id = view.get("Id")
+            if not view_id:
+                continue
+            if not sync_all and view_id not in self._sync_libraries:
+                continue
+            total, bucket = self.__count_view(view_id, view.get("CollectionType"))
+            if not total:
+                continue
+            if bucket == "movies":
+                stat.movie_count = (stat.movie_count or 0) + total
+            elif bucket == "tvshows":
+                stat.tv_count = (stat.tv_count or 0) + total
+        return stat
+
+    def __count_view(self, view_id: str,
+                     collection_type: Optional[str]) -> Tuple[int, Optional[str]]:
+        """
+        返回单个媒体库视图的 (TotalRecordCount, 桶名)。桶名取 `movies`/`tvshows`，
+        无法判定时返回 None。CollectionType 缺失时采样首个 Item 的 `Type` 决定。
+        """
+        count_url = f"{self._host}emby/Users/{self.user}/Items"
+        try:
+            res = self.__request_utils().get_res(
+                count_url,
+                params={"ParentId": view_id, "Recursive": "true", "Limit": 0}
+            )
+            if not res:
+                return 0, None
+            total = res.json().get("TotalRecordCount") or 0
+        except Exception as e:
+            logger.debug(f"按媒体库 {view_id} 统计 TotalRecordCount 出错：{e}")
+            return 0, None
+        if not total:
+            return 0, None
+        if collection_type == "movies":
+            return total, "movies"
+        if collection_type == "tvshows":
+            return total, "tvshows"
+        # CollectionType 缺失时采样一条目按 Type 兜底分类
+        try:
+            res = self.__request_utils().get_res(
+                count_url,
+                params={"ParentId": view_id, "Recursive": "true", "Limit": 1}
+            )
+            items = (res.json().get("Items") if res else None) or []
+            sample_type = items[0].get("Type") if items else None
+        except Exception as e:
+            logger.debug(f"采样媒体库 {view_id} 首条目类型出错：{e}")
+            sample_type = None
+        if sample_type == "Movie":
+            return total, "movies"
+        if sample_type in ("Series", "Episode", "Season"):
+            return total, "tvshows"
+        return total, None
 
     def __get_series_id_by_name(self, name: str, year: str) -> Optional[str]:
         """
@@ -533,7 +659,12 @@ class ZSpace:
 
     def __refresh_library_by_id(self, item_id: str) -> bool:
         """
-        通知极影视刷新一个项目的媒体库
+        通知极影视刷新一个项目的媒体库。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）未实现 `Items/{id}/Refresh`（实测 404），
+        因此该方法目前必然失败。保留实现以便兼容层补齐后自动复用，并把端点
+        缺失的常态情况降级为 debug，避免污染主日志。
         """
         if not self._host or not self._apikey:
             return False
@@ -545,16 +676,17 @@ class ZSpace:
             res = self.__request_utils().post_res(url, params=params)
             if res:
                 return True
-            else:
-                logger.info(f"刷新媒体库对象 {item_id} 失败，无法连接极影视！")
+            logger.debug(f"刷新媒体库对象 {item_id} 未生效，极影视当前 Emby 兼容层未实现该端点")
         except Exception as e:
-            logger.error(f"连接Items/Id/Refresh出错：{e}")
-            return False
+            logger.debug(f"连接Items/Id/Refresh出错：{e}（极影视当前 Emby 兼容层未实现该端点）")
         return False
 
     def refresh_root_library(self) -> bool:
         """
-        通知极影视刷新整个媒体库
+        通知极影视刷新整个媒体库。
+
+        与 `__refresh_library_by_id` 同源：极影视当前 Emby 兼容层未实现
+        `Library/Refresh`（实测 404）。保留实现并把常态失败降为 debug。
         """
         if not self._host or not self._apikey:
             return False
@@ -563,11 +695,9 @@ class ZSpace:
             res = self.__request_utils().post_res(url)
             if res:
                 return True
-            else:
-                logger.info("刷新媒体库失败，无法连接极影视！")
+            logger.debug("刷新媒体库未生效，极影视当前 Emby 兼容层未实现 Library/Refresh")
         except Exception as e:
-            logger.error(f"连接Library/Refresh出错：{e}")
-            return False
+            logger.debug(f"连接Library/Refresh出错：{e}（极影视当前 Emby 兼容层未实现该端点）")
         return False
 
     def refresh_library_by_items(self, items: List[schemas.RefreshMediaItem]) -> Optional[bool]:
@@ -956,7 +1086,12 @@ class ZSpace:
     def get_latest(self, num: Optional[int] = 20, username: Optional[str] = None) -> Optional[
         List[schemas.MediaServerPlayItem]]:
         """
-        获得最近更新
+        获得最近更新。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）的 `Users/{uid}/Items/Latest` 端点实测
+        返回 500（疑似服务端 panic），无法使用。降级为以 `DateCreated` 倒序
+        查询 `Users/{uid}/Items`，语义上近似"最近添加"。
         """
         if not self._host or not self._apikey:
             return None
@@ -966,16 +1101,24 @@ class ZSpace:
             user = self.user
         if not user:
             return []
-        url = f"{self._host}emby/Users/{user}/Items/Latest"
+        url = f"{self._host}emby/Users/{user}/Items"
         params = {
+            "Recursive": "true",
+            "SortBy": "DateCreated",
+            "SortOrder": "Descending",
+            "IncludeItemTypes": "Movie,Series",
             "Limit": 100,
-            "MediaTypes": "Video",
             "Fields": "ProductionYear,Path,BackdropImageTags"
         }
         try:
             res = self.__request_utils().get_res(url, params=params)
             if res:
-                result = res.json() or []
+                # 兼容两种返回形态：原 Latest 返回裸数组，新接口返回 {Items, TotalRecordCount}
+                payload = res.json()
+                if isinstance(payload, dict):
+                    result = payload.get("Items") or []
+                else:
+                    result = payload or []
                 ret_latest = []
                 library_folders = self.get_user_library_folders()
                 for item in result:
@@ -1002,9 +1145,9 @@ class ZSpace:
                     ))
                 return ret_latest
             else:
-                logger.error("Users/Items/Latest 未获取到返回数据")
+                logger.debug("Users/Items?SortBy=DateCreated 未获取到返回数据")
         except Exception as e:
-            logger.error(f"连接Users/Items/Latest出错：{e}")
+            logger.error(f"连接 Users/Items（DateCreated 排序）出错：{e}")
         return []
 
     def get_user_library_folders(self):
@@ -1055,23 +1198,24 @@ class ZSpace:
 
     def __get_current_user(self) -> Optional[dict]:
         """
-        获取当前登录用户信息
+        获取当前登录用户信息。
+
+        极影视当前 Emby 兼容层（`System/Info` 返回 ServerVersion=4.7.0.0，
+        对齐 Emby Server 4.7 协议）将 `Users/{seg}` 中的 {seg} 严格按 mediaUid 校验，
+        非 GUID 的 `Users/Me` 会被直接判定为 "invalid mediaUid format" 返回 400，
+        因此只走精确的 `Users/{userId}` 路径，避免污染日志且少一次无效请求。
         """
-        if not self._host or not self._apikey:
+        if not self._host or not self._apikey or not self.user:
             return None
-        urls = []
-        if self.user:
-            urls.append(f"{self._host}emby/Users/{self.user}")
-        urls.append(f"{self._host}emby/Users/Me")
-        for url in urls:
-            try:
-                res = self.__request_utils().get_res(url)
-                if res:
-                    result = res.json()
-                    if isinstance(result, dict):
-                        return result
-            except Exception as e:
-                logger.error(f"连接 {url} 出错：{e}")
+        url = f"{self._host}emby/Users/{self.user}"
+        try:
+            res = self.__request_utils().get_res(url)
+            if res:
+                result = res.json()
+                if isinstance(result, dict):
+                    return result
+        except Exception as e:
+            logger.error(f"连接 {url} 出错：{e}")
         return None
 
     def __get_current_user_id(self) -> Optional[str]:
