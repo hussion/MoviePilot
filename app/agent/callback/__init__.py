@@ -12,7 +12,7 @@ from app.schemas.message import (
     ChannelCapabilityManager,
     ChannelCapability,
 )
-from app.schemas.types import MessageChannel
+from app.schemas.types import MessageChannel, NotificationType
 
 
 class _StreamChain(ChainBase):
@@ -210,6 +210,13 @@ class StreamingHandler:
 
         # 执行最后一次刷新
         await self._flush()
+
+        message_response = self._message_response
+        if message_response:
+            await run_in_threadpool(
+                _StreamChain().finalize_message,
+                message_response,
+            )
 
         # 检查是否所有缓冲内容都已发送
         with self._lock:
@@ -462,6 +469,7 @@ class StreamingHandler:
                     Notification(
                         channel=self._channel,
                         source=self._source,
+                        mtype=NotificationType.Agent,
                         userid=self._user_id,
                         username=self._username,
                         title=self._title,
@@ -504,6 +512,7 @@ class StreamingHandler:
                             Notification(
                                 channel=self._channel,
                                 source=self._source,
+                                mtype=NotificationType.Agent,
                                 userid=self._user_id,
                                 username=self._username,
                                 title=self._title,
@@ -535,6 +544,7 @@ class StreamingHandler:
                         chat_id=self._message_response.chat_id,
                         text=current_text,
                         title=self._title,
+                        metadata=self._message_response.metadata,
                     )
                     if success:
                         with self._lock:
