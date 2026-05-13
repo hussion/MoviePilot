@@ -16,6 +16,10 @@ from langchain_core.messages import (  # noqa: F401
     HumanMessage,
     BaseMessage,
 )
+
+import warnings
+warnings.filterwarnings("ignore", message=".*allowed_objects.*")
+
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.callback import StreamingHandler
@@ -754,6 +758,8 @@ class MoviePilotAgent:
                 mtype=NotificationType.Agent,
                 userid=self.user_id,
                 username=self.username,
+                original_message_id=self.original_message_id,
+                original_chat_id=self.original_chat_id,
                 title=title,
                 text=message,
             )

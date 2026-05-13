@@ -123,19 +123,20 @@ class TestFeishu(unittest.TestCase):
     def test_parse_message_returns_callback_message(self):
         client = self._build_client()
 
-        result = client.parse_message(
-            {
-                "type": "cardAction",
-                "callback_data": "approve",
-                "message_id": "om_123",
-                "chat_id": "oc_123",
-                "sender": {
-                    "open_id": "ou_user_1",
-                    "user_id": "u_user_1",
-                    "name": "tester",
-                },
-            }
-        )
+        with patch("app.modules.feishu.feishu.UserOper.get_name", return_value=None):
+            result = client.parse_message(
+                {
+                    "type": "cardAction",
+                    "callback_data": "approve",
+                    "message_id": "om_123",
+                    "chat_id": "oc_123",
+                    "sender": {
+                        "open_id": "ou_user_1",
+                        "user_id": "u_user_1",
+                        "name": "tester",
+                    },
+                }
+            )
 
         self.assertIsNotNone(result)
         self.assertEqual(result.channel, MessageChannel.Feishu)
@@ -143,6 +144,24 @@ class TestFeishu(unittest.TestCase):
         self.assertEqual(result.text, "CALLBACK:approve")
         self.assertTrue(result.is_callback)
         self.assertEqual(result.chat_id, "oc_123")
+
+    def test_extract_card_callback_data_supports_new_and_legacy_values(self):
+        self.assertEqual(
+            Feishu._extract_card_callback_data({"callback_data": "approve"}),
+            "approve",
+        )
+        self.assertEqual(
+            Feishu._extract_card_callback_data({"value": "legacy"}),
+            "legacy",
+        )
+        self.assertEqual(
+            Feishu._extract_card_callback_data("direct"),
+            "direct",
+        )
+        self.assertEqual(
+            Feishu._extract_card_callback_data({}, name="fallback"),
+            "fallback",
+        )
 
     def test_build_event_handler_registers_common_im_events(self):
         registered = []
@@ -177,7 +196,9 @@ class TestFeishu(unittest.TestCase):
     def test_parse_message_blocks_non_admin_command(self):
         client = self._build_client(FEISHU_ADMINS="ou_admin")
 
-        with patch.object(client, "send_text", return_value={"success": True}) as send_text:
+        with patch("app.modules.feishu.feishu.UserOper.get_name", return_value=None), patch.object(
+            client, "send_text", return_value={"success": True}
+        ) as send_text:
             result = client.parse_message(
                 {
                     "type": "message",
@@ -197,6 +218,30 @@ class TestFeishu(unittest.TestCase):
             userid="ou_user_2",
             chat_id="oc_chat_1",
             receive_id_type="open_id",
+        )
+
+    def test_parse_message_maps_feishu_ids_to_moviepilot_username(self):
+        client = self._build_client()
+
+        with patch("app.modules.feishu.feishu.UserOper.get_name", return_value="moviepilot-user") as get_name:
+            result = client.parse_message(
+                {
+                    "type": "message",
+                    "text": "/ai 添加黑客帝国订阅",
+                    "sender": {
+                        "open_id": "ou_bound_user",
+                        "user_id": "u_bound_user",
+                        "name": "ou_bound_user",
+                    },
+                }
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.userid, "ou_bound_user")
+        self.assertEqual(result.username, "moviepilot-user")
+        get_name.assert_called_once_with(
+            feishu_openid="ou_bound_user",
+            feishu_userid="u_bound_user",
         )
 
     def test_send_notification_uses_direct_card_content(self):
@@ -221,9 +266,59 @@ class TestFeishu(unittest.TestCase):
 
         content = json.loads(request.request_body.content)
         self.assertNotIn("card", content)
+        self.assertEqual(content["schema"], "2.0")
         self.assertTrue(content["config"]["update_multi"])
-        self.assertEqual(content["elements"][0]["text_size"], "heading")
-        self.assertEqual(content["elements"][0]["tag"], "markdown")
+        self.assertEqual(content["body"]["padding"], "12px 12px 12px 12px")
+        self.assertEqual(content["body"]["elements"][0]["text_size"], "heading")
+        self.assertEqual(content["body"]["elements"][0]["tag"], "markdown")
+        button = content["body"]["elements"][-1]["columns"][0]["elements"][0]
+        self.assertEqual(button["tag"], "button")
+        self.assertNotIn("value", button)
+        self.assertEqual(
+            button["behaviors"],
+            [{"type": "callback", "value": {"callback_data": "confirm"}}],
+        )
+
+    def test_send_notification_embeds_remote_image_in_card(self):
+        client = self._build_client()
+        image_upload_response = MagicMock()
+        image_upload_response.success.return_value = True
+        image_upload_response.data = SimpleNamespace(image_key="img_v2_remote")
+        client._api_client, message_api = self._build_message_api(
+            create_response=self._success_response(),
+            image_create_response=image_upload_response,
+        )
+
+        response = MagicMock()
+        response.content = b"png-bytes"
+        response.headers = {"Content-Type": "image/png"}
+
+        with patch("app.modules.feishu.feishu.RequestUtils") as request_utils:
+            request_utils.return_value.get_res.return_value = response
+            result = client.send_notification(
+                Notification(
+                    title="测试标题",
+                    text="测试正文",
+                    image="https://example.com/poster.png",
+                    buttons=[[{"text": "确认", "callback_data": "confirm"}]],
+                ),
+                userid="ou_user_img",
+            )
+
+        self.assertTrue(result["success"])
+        response.close.assert_called_once()
+        client._api_client.im.v1.image.create.assert_called_once()
+        request = message_api.create.call_args.args[0]
+        self.assertEqual(request.request_body.msg_type, "interactive")
+        content = json.loads(request.request_body.content)
+        self.assertEqual(content["body"]["padding"], "0px 0px 0px 0px")
+        image_element = content["body"]["elements"][0]
+        self.assertEqual(image_element["tag"], "img")
+        self.assertEqual(image_element["img_key"], "img_v2_remote")
+        self.assertEqual(content["body"]["elements"][1]["margin"], "12px 12px 0px 12px")
+        self.assertEqual(content["body"]["elements"][2]["margin"], "4px 12px 12px 12px")
+        self.assertEqual(content["body"]["elements"][-1]["margin"], "0px 12px 12px 12px")
+        self.assertEqual(content["body"]["elements"][-1]["tag"], "column_set")
 
     def test_send_notification_supports_user_id_target(self):
         client = self._build_client()
@@ -261,8 +356,14 @@ class TestFeishu(unittest.TestCase):
         self.assertEqual(request.message_id, "om_456")
         content = json.loads(request.request_body.content)
         self.assertNotIn("card", content)
+        self.assertEqual(content["schema"], "2.0")
         self.assertTrue(content["config"]["update_multi"])
-        self.assertEqual(content["elements"][0]["tag"], "markdown")
+        self.assertEqual(content["body"]["elements"][0]["tag"], "markdown")
+        button = content["body"]["elements"][-1]["columns"][0]["elements"][0]
+        self.assertEqual(
+            button["behaviors"],
+            [{"type": "callback", "value": {"callback_data": "confirm"}}],
+        )
 
     def test_send_notification_replies_when_original_message_id_is_present(self):
         client = self._build_client()
@@ -425,33 +526,34 @@ class TestFeishu(unittest.TestCase):
     def test_parse_message_supports_image_and_file_payloads(self):
         client = self._build_client()
 
-        image_message = client.parse_message(
-            {
-                "type": "message",
-                "text": "",
-                "images": [{"ref": "feishu://image/img_v2_test"}],
-                "message_id": "om_img",
-                "chat_id": "oc_chat",
-                "sender": {
-                    "open_id": "ou_user_5",
-                    "name": "tester",
-                },
-            }
-        )
+        with patch("app.modules.feishu.feishu.UserOper.get_name", return_value=None):
+            image_message = client.parse_message(
+                {
+                    "type": "message",
+                    "text": "",
+                    "images": [{"ref": "feishu://image/img_v2_test"}],
+                    "message_id": "om_img",
+                    "chat_id": "oc_chat",
+                    "sender": {
+                        "open_id": "ou_user_5",
+                        "name": "tester",
+                    },
+                }
+            )
 
-        file_message = client.parse_message(
-            {
-                "type": "message",
-                "text": "",
-                "files": [{"ref": "feishu://file/file_key/report.pdf", "name": "report.pdf"}],
-                "message_id": "om_file",
-                "chat_id": "oc_chat",
-                "sender": {
-                    "open_id": "ou_user_6",
-                    "name": "tester",
-                },
-            }
-        )
+            file_message = client.parse_message(
+                {
+                    "type": "message",
+                    "text": "",
+                    "files": [{"ref": "feishu://file/file_key/report.pdf", "name": "report.pdf"}],
+                    "message_id": "om_file",
+                    "chat_id": "oc_chat",
+                    "sender": {
+                        "open_id": "ou_user_6",
+                        "name": "tester",
+                    },
+                }
+            )
 
         self.assertEqual(image_message.images[0].ref, "feishu://image/img_v2_test")
         self.assertEqual(file_message.files[0].ref, "feishu://file/file_key/report.pdf")
@@ -474,6 +576,24 @@ class TestFeishu(unittest.TestCase):
         payload = forward.call_args.args[0]
         self.assertEqual(payload["images"][0]["ref"], "feishu://image/om_img_evt/img_v2_evt")
 
+    def test_on_message_wraps_feishu_audio_ref_with_message_id(self):
+        client = self._build_client()
+        message = SimpleNamespace(
+            message_id="om_audio_evt",
+            chat_id="oc_chat_evt",
+            chat_type="p2p",
+            message_type="audio",
+            content=json.dumps({"file_key": "file_audio_evt", "file_name": "voice.opus"}),
+        )
+        sender = SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_user_evt", user_id=None))
+        event = SimpleNamespace(sender=sender, message=message)
+
+        with patch.object(client, "_forward_to_message_chain") as forward:
+            client._on_message(SimpleNamespace(event=event))
+
+        payload = forward.call_args.args[0]
+        self.assertEqual(payload["audio_refs"], ["feishu://file/om_audio_evt/file_audio_evt/voice.opus"])
+
     def test_feishu_channel_capabilities_enable_images_and_files(self):
         self.assertTrue(
             ChannelCapabilityManager.supports_capability(
@@ -488,7 +608,7 @@ class TestFeishu(unittest.TestCase):
             )
         )
 
-    def test_send_file_uploads_image_then_sends_image_message(self):
+    def test_send_file_uploads_image_then_sends_mixed_card(self):
         client = self._build_client()
         image_upload_response = MagicMock()
         image_upload_response.success.return_value = True
@@ -501,13 +621,53 @@ class TestFeishu(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".png") as fp:
             fp.write(b"png-bytes")
             fp.flush()
-            result = client.send_file(file_path=fp.name, userid="ou_user_7")
+            result = client.send_file(
+                file_path=fp.name,
+                userid="ou_user_7",
+                title="图片标题",
+                text="图片说明",
+            )
 
         self.assertTrue(result["success"])
         client._api_client.im.v1.image.create.assert_called_once()
         request = message_api.create.call_args.args[0]
-        self.assertEqual(request.request_body.msg_type, "image")
-        self.assertEqual(json.loads(request.request_body.content)["image_key"], "img_v2_uploaded")
+        self.assertEqual(request.request_body.msg_type, "interactive")
+        content = json.loads(request.request_body.content)
+        self.assertEqual(content["body"]["padding"], "0px 0px 0px 0px")
+        self.assertEqual(content["body"]["elements"][0]["img_key"], "img_v2_uploaded")
+        self.assertEqual(content["body"]["elements"][1]["content"], "图片标题")
+        self.assertEqual(content["body"]["elements"][1]["margin"], "12px 12px 0px 12px")
+        self.assertEqual(content["body"]["elements"][2]["content"], "图片说明")
+        self.assertEqual(content["body"]["elements"][2]["margin"], "4px 12px 12px 12px")
+
+    def test_send_file_keeps_non_image_file_message_and_caption(self):
+        client = self._build_client()
+        file_upload_response = MagicMock()
+        file_upload_response.success.return_value = True
+        file_upload_response.data = SimpleNamespace(file_key="file_doc")
+        client._api_client, message_api = self._build_message_api(
+            create_response=self._success_response(message_id="om_file"),
+            file_create_response=file_upload_response,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".txt") as fp, patch.object(
+            client, "send_text", return_value={"success": True}
+        ) as send_text:
+            fp.write(b"text-bytes")
+            fp.flush()
+            result = client.send_file(
+                file_path=fp.name,
+                userid="ou_user_7",
+                title="文件标题",
+                text="文件说明",
+            )
+
+        self.assertTrue(result["success"])
+        client._api_client.im.v1.file.create.assert_called_once()
+        request = message_api.create.call_args.args[0]
+        self.assertEqual(request.request_body.msg_type, "file")
+        self.assertEqual(json.loads(request.request_body.content)["file_key"], "file_doc")
+        send_text.assert_called_once()
 
     def test_send_voice_uploads_audio_file_and_optionally_sends_caption(self):
         client = self._build_client()
@@ -543,9 +703,9 @@ class TestFeishu(unittest.TestCase):
             message_resource_response=self._resource_response(b"resource-bytes", file_name="voice.opus", content_type="audio/ogg"),
         )
 
-        image_download = client._download_image_bytes("img_v2_test")
-        file_download = client._download_file_bytes("file_test")
-        resource_download = client._download_message_resource_bytes("om_test", "file_test", "audio")
+        image_download = client.download_image_bytes("img_v2_test")
+        file_download = client.download_file_bytes("file_test")
+        resource_download = client.download_message_resource_bytes("om_test", "file_test", "audio")
 
         self.assertEqual(image_download[0], b"image-bytes")
         self.assertEqual(file_download[0], b"file-bytes")
@@ -633,22 +793,32 @@ class TestFeishu(unittest.TestCase):
     def test_module_download_helpers_delegate_to_client(self):
         module = FeishuModule()
         client = MagicMock()
-        client._download_image_bytes.return_value = (b"image", "poster.png", "image/png")
-        client._download_file_bytes.return_value = (b"file", "note.txt", "text/plain")
-        client._download_message_resource_bytes.return_value = (b"image", "poster.png", "image/png")
+        client.download_image_bytes.return_value = (b"image", "poster.png", "image/png")
+        client.download_file_bytes.return_value = (b"file", "note.txt", "text/plain")
+        client.download_message_resource_bytes.return_value = (b"image", "poster.png", "image/png")
 
         with patch.object(module, "get_config", return_value=SimpleNamespace(name="feishu-main")), patch.object(
             module, "get_instance", return_value=client
         ):
             data_url = module.download_feishu_image_to_data_url("feishu://image/om_msg/img_v2_xxx", "feishu-main")
             file_bytes = module.download_feishu_file_bytes("feishu://file/file_xxx/note.txt", "feishu-main")
+            audio_bytes = module.download_feishu_file_bytes(
+                "feishu://file/om_audio/file_audio/voice.opus",
+                "feishu-main",
+            )
 
         self.assertTrue(data_url.startswith("data:image/png;base64,"))
         self.assertEqual(file_bytes, b"file")
-        client._download_message_resource_bytes.assert_called_once_with(
+        self.assertEqual(audio_bytes, b"image")
+        client.download_message_resource_bytes.assert_any_call(
             message_id="om_msg",
             file_key="img_v2_xxx",
             resource_type="image",
+        )
+        client.download_message_resource_bytes.assert_any_call(
+            message_id="om_audio",
+            file_key="file_audio",
+            resource_type="audio",
         )
 
     def test_module_message_reaction_helpers_delegate_to_client(self):
@@ -707,6 +877,66 @@ class TestFeishu(unittest.TestCase):
 
         client.send_file.assert_called_once()
         client.send_voice.assert_called_once()
+
+    def test_module_post_message_sends_image_card_before_file_attachment(self):
+        module = FeishuModule()
+        conf = SimpleNamespace(name="feishu-main")
+        client = MagicMock()
+
+        with patch.object(module, "get_configs", return_value={"feishu-main": conf}), patch.object(
+            module, "check_message", return_value=True
+        ), patch.object(module, "get_instance", return_value=client):
+            module.post_message(
+                Notification(
+                    file_path="/tmp/demo.txt",
+                    file_name="demo.txt",
+                    image="https://example.com/poster.png",
+                    text="说明",
+                    title="标题",
+                    userid="ou_user",
+                )
+            )
+
+        client.send_notification.assert_called_once()
+        sent_message = client.send_notification.call_args.kwargs["message"]
+        self.assertEqual(sent_message.image, "https://example.com/poster.png")
+        self.assertIsNone(sent_message.file_path)
+        client.send_file.assert_called_once()
+        self.assertIsNone(client.send_file.call_args.kwargs.get("title"))
+        self.assertIsNone(client.send_file.call_args.kwargs.get("text"))
+
+    def test_module_send_direct_message_sends_image_card_before_file_attachment(self):
+        module = FeishuModule()
+        module._channel = MessageChannel.Feishu
+        conf = SimpleNamespace(name="feishu-main")
+        client = MagicMock()
+        client.send_notification.return_value = {
+            "success": True,
+            "message_id": "om_card",
+            "chat_id": "oc_card",
+        }
+        client.send_file.return_value = {"success": True, "message_id": "om_file"}
+
+        with patch.object(module, "get_configs", return_value={"feishu-main": conf}), patch.object(
+            module, "check_message", return_value=True
+        ), patch.object(module, "get_instance", return_value=client):
+            response = module.send_direct_message(
+                Notification(
+                    channel=MessageChannel.Feishu,
+                    source="feishu-main",
+                    file_path="/tmp/demo.txt",
+                    file_name="demo.txt",
+                    image="https://example.com/poster.png",
+                    text="说明",
+                    title="标题",
+                    userid="ou_user",
+                )
+            )
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.message_id, "om_card")
+        client.send_notification.assert_called_once()
+        client.send_file.assert_called_once()
 
     def test_module_post_message_passes_original_message_id_for_reply(self):
         module = FeishuModule()

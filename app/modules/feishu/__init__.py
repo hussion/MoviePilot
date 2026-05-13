@@ -92,7 +92,24 @@ class FeishuModule(_ModuleBase, _MessageBase[Feishu]):
             userid, chat_id, receive_id_type = self._resolve_message_target(message)
             client: Feishu = self.get_instance(conf.name)
             if client:
-                if message.file_path:
+                if message.image and message.file_path:
+                    # 普通文件无法嵌入卡片，先发送图文卡片，再单独发送附件，避免图片被 file_path 分支吞掉。
+                    client.send_notification(
+                        message=message.model_copy(update={"file_path": None, "file_name": None}),
+                        userid=userid,
+                        chat_id=chat_id,
+                        receive_id_type=receive_id_type,
+                        original_message_id=str(message.original_message_id) if message.original_message_id else None,
+                    )
+                    client.send_file(
+                        file_path=message.file_path,
+                        userid=userid,
+                        chat_id=chat_id,
+                        file_name=message.file_name,
+                        receive_id_type=receive_id_type,
+                        original_message_id=str(message.original_message_id) if message.original_message_id else None,
+                    )
+                elif message.file_path:
                     client.send_file(
                         file_path=message.file_path,
                         userid=userid,
@@ -161,9 +178,9 @@ class FeishuModule(_ModuleBase, _MessageBase[Feishu]):
             title: Optional[str] = None,
             buttons: Optional[List[List[dict]]] = None,
             metadata: Optional[dict] = None,
-    ) -> bool:
+    ) -> Optional[bool]:
         if channel != self._channel:
-            return False
+            return None
         for conf in self.get_configs().values():
             if source != conf.name:
                 continue
@@ -186,7 +203,24 @@ class FeishuModule(_ModuleBase, _MessageBase[Feishu]):
             client: Feishu = self.get_instance(conf.name)
             if not client:
                 continue
-            if message.file_path:
+            if message.image and message.file_path:
+                result = client.send_notification(
+                    message=message.model_copy(update={"file_path": None, "file_name": None}),
+                    userid=userid,
+                    chat_id=chat_id,
+                    receive_id_type=receive_id_type,
+                    original_message_id=str(message.original_message_id) if message.original_message_id else None,
+                )
+                if result and result.get("success"):
+                    client.send_file(
+                        file_path=message.file_path,
+                        userid=userid,
+                        chat_id=chat_id,
+                        file_name=message.file_name,
+                        receive_id_type=receive_id_type,
+                        original_message_id=str(message.original_message_id) if message.original_message_id else None,
+                    )
+            elif message.file_path:
                 result = client.send_file(
                     file_path=message.file_path,
                     userid=userid,
@@ -243,13 +277,13 @@ class FeishuModule(_ModuleBase, _MessageBase[Feishu]):
             image_key = image_key.strip()
         downloaded = None
         if message_id:
-            downloaded = client._download_message_resource_bytes(
+            downloaded = client.download_message_resource_bytes(
                 message_id=message_id,
                 file_key=image_key,
                 resource_type="image",
             )
         if not downloaded:
-            downloaded = client._download_image_bytes(image_key)
+            downloaded = client.download_image_bytes(image_key)
         if not downloaded:
             return None
         content, _, content_type = downloaded
@@ -267,11 +301,32 @@ class FeishuModule(_ModuleBase, _MessageBase[Feishu]):
         client = self.get_instance(client_config.name)
         if not client:
             return None
-        parts = file_ref.replace("feishu://file/", "", 1).split("/", 1)
-        file_key = parts[0].strip() if parts else ""
+        parts = [
+            part.strip()
+            for part in file_ref.replace("feishu://file/", "", 1).split("/")
+            if part.strip()
+        ]
+        file_key = ""
+        downloaded = None
+        if len(parts) >= 2 and parts[0].startswith("om_"):
+            message_id, file_key = parts[0], parts[1]
+            downloaded = client.download_message_resource_bytes(
+                message_id=message_id,
+                file_key=file_key,
+                resource_type="audio",
+            )
+            if not downloaded:
+                downloaded = client.download_message_resource_bytes(
+                    message_id=message_id,
+                    file_key=file_key,
+                    resource_type="file",
+                )
+        else:
+            file_key = parts[0] if parts else ""
         if not file_key:
             return None
-        downloaded = client._download_file_bytes(file_key)
+        if not downloaded:
+            downloaded = client.download_file_bytes(file_key)
         if not downloaded:
             return None
         content, _, _ = downloaded
@@ -296,7 +351,7 @@ class FeishuModule(_ModuleBase, _MessageBase[Feishu]):
             message_id: str,
             reaction_id: str,
             source: str,
-    ) -> bool:
+    ) -> Optional[bool]:
         client_config = self.get_config(source)
         if not client_config:
             return False
