@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import gzip
+import json as jsonlib
 import logging
 import time
 from copy import deepcopy
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 class TMDb(object):
     _RESPONSE_SNAPSHOT_MARKER = "__mp_tmdb_response_snapshot__"
+    _JSON_DECODE_FAILED = object()
 
     def __init__(self, session=None, language=None):
         self._api_key = settings.TMDB_API_KEY
@@ -130,11 +133,16 @@ class TMDb(object):
 
     @classmethod
     def _snapshot_response(cls, response):
+        """
+        生成可缓存的响应快照，并在入缓存前拦截明显异常的TMDB响应结构。
+        """
+        json_data = cls._decode_response_json(response)
+        cls._validate_json_response(json_data)
         # Redis 不能稳定序列化 requests/httpx 响应对象，缓存里只保留当前流程会用到的数据。
         return {
             cls._RESPONSE_SNAPSHOT_MARKER: True,
             "headers": dict(response.headers.items()),
-            "json": response.json(),
+            "json": json_data,
         }
 
     @classmethod
@@ -148,7 +156,139 @@ class TMDb(object):
         if isinstance(response, dict) and response.get(cls._RESPONSE_SNAPSHOT_MARKER):
             # 调用方会补充 media_type 等字段，缓存快照必须隔离这些原地修改。
             return deepcopy(response.get("json"))
-        return response.json()
+        return cls._decode_response_json(response)
+
+    @classmethod
+    def _decode_response_json(cls, response):
+        """
+        解析TMDB响应JSON，并把空响应、代理错误页或错误编码的响应统一转换为TMDB异常。
+        """
+        try:
+            return response.json()
+        except (ValueError, UnicodeDecodeError) as err:
+            # httpx.Response.json() 在响应体是压缩字节或错误编码时会直接抛 UnicodeDecodeError，
+            # 先尝试兼容未被客户端解压的 gzip JSON，仍失败时再收敛成 TMDbException。
+            json_data = cls._decode_compressed_response_json(response)
+            if json_data is not cls._JSON_DECODE_FAILED:
+                return json_data
+            raise TMDbException(cls._build_invalid_json_message(response, err)) from err
+
+    @classmethod
+    def _decode_compressed_response_json(cls, response):
+        """
+        尝试解析未被HTTP客户端自动解压的压缩JSON响应。
+        """
+        response_content = getattr(response, "content", b"") or b""
+        if isinstance(response_content, str):
+            response_content = response_content.encode("utf-8")
+        if not isinstance(response_content, (bytes, bytearray)):
+            return cls._JSON_DECODE_FAILED
+
+        content_bytes = bytes(response_content)
+        content_encoding = cls._get_header_value(
+            getattr(response, "headers", {}) or {},
+            "Content-Encoding",
+        ) or ""
+        encodings = {
+            encoding.strip().lower()
+            for encoding in str(content_encoding).split(",")
+            if encoding.strip()
+        }
+        if "gzip" not in encodings and not content_bytes.startswith(b"\x1f\x8b"):
+            return cls._JSON_DECODE_FAILED
+
+        try:
+            return jsonlib.loads(gzip.decompress(content_bytes))
+        except (OSError, EOFError, ValueError, UnicodeDecodeError):
+            return cls._JSON_DECODE_FAILED
+
+    @staticmethod
+    def _get_header_value(headers, name):
+        """
+        从不同响应头对象中按大小写兼容读取指定响应头。
+        """
+        try:
+            value = headers.get(name)
+        except AttributeError:
+            return None
+        if value is not None:
+            return value
+
+        lower_name = name.lower()
+        try:
+            for header_name, header_value in headers.items():
+                if str(header_name).lower() == lower_name:
+                    return header_value
+        except AttributeError:
+            return None
+        return None
+
+    @staticmethod
+    def _build_invalid_json_message(response, parse_error: Exception = None):
+        """
+        生成非JSON响应的诊断信息，避免日志只保留JSONDecodeError文本。
+        """
+        status_code = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", {}) or {}
+        content_type = TMDb._get_header_value(headers, "Content-Type")
+        is_encoding_error = isinstance(parse_error, UnicodeDecodeError)
+
+        # 编码错误时响应体通常是压缩字节或乱码，打印内容只会污染日志。
+        response_text = ""
+        if not is_encoding_error:
+            try:
+                response_text = getattr(response, "text", "") or ""
+            except Exception as err:  # pragma: no cover - 防御异常响应对象
+                response_text = f"<读取响应内容失败：{err!r}>"
+            if not isinstance(response_text, str):
+                response_text = repr(response_text)
+            response_text = response_text.strip()
+            if len(response_text) > 200:
+                response_text = f"{response_text[:200]}..."
+
+        message_parts = ["TheMovieDb 返回数据不是有效JSON"]
+        if status_code is not None:
+            message_parts.append(f"HTTP状态码：{status_code}")
+        if content_type:
+            message_parts.append(f"Content-Type：{content_type}")
+        content_encoding = TMDb._get_header_value(headers, "Content-Encoding")
+        if content_encoding:
+            message_parts.append(f"Content-Encoding：{content_encoding}")
+        if is_encoding_error:
+            message_parts.append("响应内容因编码错误已省略")
+        elif response_text:
+            message_parts.append(f"响应内容：{response_text!r}")
+        else:
+            message_parts.append("响应内容为空")
+        return "，".join(message_parts)
+
+    @staticmethod
+    def _validate_json_response(json_data):
+        """
+        校验TMDB响应JSON顶层结构，避免代理错误页等标量值继续按字典解析。
+        """
+        if isinstance(json_data, (dict, list)):
+            return
+
+        payload_preview = repr(json_data)
+        if len(payload_preview) > 200:
+            payload_preview = f"{payload_preview[:200]}..."
+        raise TMDbException(
+            "TheMovieDb 返回数据格式异常：期望JSON对象或数组，"
+            f"实际为{type(json_data).__name__}，内容：{payload_preview}"
+        )
+
+    @staticmethod
+    def _get_json_key(json_data, key):
+        """
+        从TMDB对象响应中读取指定字段，避免异常顶层结构触发AttributeError。
+        """
+        if not isinstance(json_data, dict):
+            raise TMDbException(
+                "TheMovieDb 返回数据格式异常："
+                f"期望JSON对象包含字段 {key!r}，实际为{type(json_data).__name__}"
+            )
+        return json_data.get(key)
 
     def cache_clear(self):
         return self.request.cache_clear()
@@ -190,6 +330,12 @@ class TMDb(object):
         return 0
 
     def _process_json_response(self, json_data, is_async=False):
+        """
+        从TMDB对象响应中记录分页信息；数组响应没有分页字段，直接跳过。
+        """
+        if not isinstance(json_data, dict):
+            return
+
         if "page" in json_data:
             self._page = json_data["page"]
 
@@ -201,6 +347,12 @@ class TMDb(object):
 
     @staticmethod
     def _handle_errors(json_data):
+        """
+        将TMDB标准错误字段转换为统一异常，非对象响应由结构校验提前处理。
+        """
+        if not isinstance(json_data, dict):
+            return
+
         if "errors" in json_data:
             raise TMDbException(json_data["errors"])
 
@@ -228,11 +380,12 @@ class TMDb(object):
             return self._request_obj(action, params, False, method, data, json, key)
 
         json_data = self._get_response_json(req)
+        self._validate_json_response(json_data)
         self._process_json_response(json_data, is_async=False)
         self._handle_errors(json_data)
 
         if key:
-            return json_data.get(key)
+            return self._get_json_key(json_data, key)
         return json_data
 
     async def _async_request_obj(self, action, params="", call_cached=True,
@@ -256,11 +409,12 @@ class TMDb(object):
             return await self._async_request_obj(action, params, False, method, data, json, key)
 
         json_data = self._get_response_json(req)
+        self._validate_json_response(json_data)
         self._process_json_response(json_data, is_async=True)
         self._handle_errors(json_data)
 
         if key:
-            return json_data.get(key)
+            return self._get_json_key(json_data, key)
         return json_data
 
     def close(self):
