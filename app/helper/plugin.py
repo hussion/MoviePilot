@@ -8,6 +8,7 @@ import site
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import zipfile
 from pathlib import Path
@@ -25,9 +26,10 @@ from packaging.version import Version, InvalidVersion
 from importlib.metadata import distributions
 from requests import Response
 
-from app.core.cache import cached
+from app.core.cache import cached, is_fresh
 from app.core.config import settings
 from app.db.systemconfig_oper import SystemConfigOper
+from app.helper.package import PackageInstallRequest, build_package_install_strategies
 from app.log import logger
 from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils, AsyncRequestUtils
@@ -48,11 +50,11 @@ class PluginHelper(metaclass=WeakSingleton):
     """
 
     _base_url = "https://raw.githubusercontent.com/{user}/{repo}/main/"
-    _install_reg = f"{settings.MP_SERVER_HOST}/plugin/install/{{pid}}"
-    _install_report = f"{settings.MP_SERVER_HOST}/plugin/install"
-    _install_statistic = f"{settings.MP_SERVER_HOST}/plugin/statistic"
     # 串行化运行期依赖安装，避免多个 pip 子进程和导入缓存刷新互相踩踏。
     _pip_install_lock = threading.Lock()
+    # 同仓库的并发 Release 请求共享任务；事件循环参与键控，避免热重载或测试循环切换后复用失效任务。
+    _release_task_lock = threading.Lock()
+    _release_tasks: Dict[Tuple[asyncio.AbstractEventLoop, str, bool], asyncio.Task] = {}
     # 这些包一旦被插件覆盖，最容易直接拖垮主程序启动，因此冲突提示需要单独高亮。
     _protected_runtime_packages = frozenset({
         "alembic",
@@ -71,10 +73,6 @@ class PluginHelper(metaclass=WeakSingleton):
 
     def __init__(self):
         self.systemconfig = SystemConfigOper()
-        if settings.PLUGIN_STATISTIC_SHARE:
-            if not self.systemconfig.get(SystemConfigKey.PluginInstallReport):
-                if self.install_report():
-                    self.systemconfig.set(SystemConfigKey.PluginInstallReport, "1")
 
     @staticmethod
     def is_local_repo_url(repo_url: Optional[str]) -> bool:
@@ -145,25 +143,6 @@ class PluginHelper(metaclass=WeakSingleton):
             return values[0]
         except Exception:
             return None
-
-    @staticmethod
-    def sanitize_repo_url_for_statistic(repo_url: Optional[str]) -> Optional[str]:
-        """
-        统计上报前脱敏 repo_url，避免泄露本地仓库绝对路径
-        """
-        if not repo_url:
-            return repo_url
-        if not PluginHelper.is_local_repo_url(repo_url):
-            return repo_url
-
-        pid = PluginHelper.parse_local_repo_url(repo_url)
-        if not pid:
-            return LOCAL_REPO_PREFIX.rstrip("/")
-
-        return PluginHelper.make_local_repo_url(
-            pid=pid,
-            package_version=PluginHelper.parse_local_repo_package_version(repo_url)
-        )
 
     @staticmethod
     def get_current_system_version() -> Optional[Version]:
@@ -254,7 +233,7 @@ class PluginHelper(metaclass=WeakSingleton):
         if not package_file.exists():
             return {}
         try:
-            content = package_file.read_text(encoding="utf-8")
+            content = package_file.read_text(encoding="utf-8", errors="replace")
             payload = json.loads(content)
         except Exception as e:
             logger.warn(f"读取本地插件包 {package_file} 失败：{e}")
@@ -332,9 +311,11 @@ class PluginHelper(metaclass=WeakSingleton):
 
     def get_local_plugin_candidate(self, pid: str, package_version: Optional[str] = None,
                                    repo_path: Optional[Path] = None,
-                                   strict_compat: bool = True) -> Optional[dict]:
+                                   strict_compat: bool = True,
+                                   strict_system_version: bool = True) -> Optional[dict]:
         """
         获取指定插件ID的本地插件候选
+        :param strict_system_version: 是否将主系统版本范围不匹配视为不可用候选
         """
         if not pid:
             return None
@@ -377,7 +358,7 @@ class PluginHelper(metaclass=WeakSingleton):
                             candidate["compatible"] = False
                             candidate["skip_reason"] = f"package.json 未声明 {settings.VERSION_FLAG} 兼容"
                         self.annotate_plugin_system_version(candidate)
-                        if candidate.get("system_version_compatible") is False:
+                        if strict_system_version and candidate.get("system_version_compatible") is False:
                             candidate["compatible"] = False
                             candidate["skip_reason"] = candidate.get("system_version_message")
                         if package_version is not None:
@@ -394,8 +375,25 @@ class PluginHelper(metaclass=WeakSingleton):
         candidates = self.get_local_plugin_candidates()
         for candidate_pid, candidate in candidates.items():
             if candidate_pid.lower() == pid.lower():
+                if strict_system_version and candidate.get("system_version_compatible") is False:
+                    candidate = candidate.copy()
+                    candidate["compatible"] = False
+                    candidate["skip_reason"] = candidate.get("system_version_message")
                 return candidate
         return None
+
+    @staticmethod
+    def __append_cache_buster(url: str) -> str:
+        """
+        强制刷新插件库索引时追加时间戳，绕过 GitHub 镜像或中间代理的缓存。
+        """
+        if not is_fresh():
+            return url
+
+        parts = urlsplit(url)
+        refresh_param = f"_refresh={time.time_ns()}"
+        query = f"{parts.query}&{refresh_param}" if parts.query else refresh_param
+        return parts._replace(query=query).geturl()
 
     @staticmethod
     def __parse_plugin_index_response(content: str) -> Optional[Dict[str, dict]]:
@@ -415,6 +413,76 @@ class PluginHelper(metaclass=WeakSingleton):
 
         return payload
 
+    @staticmethod
+    def __build_plugin_release_item(pid: str, release_info: dict) -> Optional[dict]:
+        """
+        从 GitHub release 响应中提取可安装版本，仅接受规范 tag 与同名 zip 资产。
+        """
+        if not isinstance(release_info, dict):
+            return None
+
+        tag_name = release_info.get("tag_name")
+        if not isinstance(tag_name, str):
+            return None
+
+        tag_prefix = f"{pid}_v"
+        if not tag_name.startswith(tag_prefix):
+            return None
+
+        version = tag_name[len(tag_prefix):]
+        if not version:
+            return None
+
+        asset_name = f"{tag_name.lower()}.zip"
+        assets = release_info.get("assets") or []
+        if not any(isinstance(asset, dict) and asset.get("name") == asset_name for asset in assets):
+            return None
+
+        return {
+            "version": version,
+            "tag_name": tag_name,
+            "name": release_info.get("name") or tag_name,
+            "published_at": release_info.get("published_at"),
+            "body": release_info.get("body") or "",
+            "asset_name": asset_name,
+        }
+
+    @staticmethod
+    def __parse_plugin_release_response(pid: str, payload) -> List[dict]:
+        """
+        解析 GitHub release 列表，过滤出当前插件可直接安装的 release 资产。
+        """
+        if not isinstance(payload, list):
+            return []
+
+        releases = []
+        for release_info in payload:
+            item = PluginHelper.__build_plugin_release_item(pid, release_info)
+            if item:
+                releases.append(item)
+        return releases
+
+    @staticmethod
+    def __normalize_plugin_release_response(payload) -> List[dict]:
+        """仅保留版本展示和资产匹配所需字段，控制仓库级缓存体积。"""
+        if not isinstance(payload, list):
+            return []
+        return [
+            {
+                "tag_name": release_info.get("tag_name"),
+                "name": release_info.get("name"),
+                "published_at": release_info.get("published_at"),
+                "body": release_info.get("body"),
+                "assets": [
+                    {"name": asset.get("name")}
+                    for asset in release_info.get("assets") or []
+                    if isinstance(asset, dict)
+                ],
+            }
+            for release_info in payload
+            if isinstance(release_info, dict)
+        ]
+
     @cached(maxsize=128, ttl=1800)
     def get_plugins(self, repo_url: str,
                     package_version: Optional[str] = None) -> Optional[Dict[str, dict]]:
@@ -432,6 +500,7 @@ class PluginHelper(metaclass=WeakSingleton):
 
         raw_url = self._base_url.format(user=user, repo=repo)
         package_url = f"{raw_url}package.{package_version}.json" if package_version else f"{raw_url}package.json"
+        package_url = self.__append_cache_buster(package_url)
 
         res = self.__request_with_fallback(package_url, headers=settings.REPO_GITHUB_HEADERS(repo=f"{user}/{repo}"))
         if res is None:
@@ -441,6 +510,63 @@ class PluginHelper(metaclass=WeakSingleton):
         if res.status_code != 200:
             return None
         return self.__parse_plugin_index_response(res.text)
+
+    @cached(maxsize=32, ttl=1800, shared_key="get_plugin_repo_releases")
+    def _get_plugin_repo_releases(self, repo_url: str) -> Optional[List[dict]]:
+        """
+        按仓库获取 GitHub Release 原始分页数据，供仓库内所有插件共享。
+        """
+        if not repo_url:
+            return []
+
+        user, repo = self.get_repo_info(repo_url)
+        if not user or not repo:
+            return []
+
+        user_repo = f"{user}/{repo}"
+        releases = []
+        for page in range(1, 11):
+            release_api = f"https://api.github.com/repos/{user_repo}/releases?per_page=100&page={page}"
+            release_api = self.__append_cache_buster(release_api)
+            res = self.__request_with_fallback(
+                release_api,
+                headers=settings.REPO_GITHUB_HEADERS(repo=user_repo),
+                timeout=30,
+                is_api=True,
+            )
+            if res is None or res.status_code != 200:
+                return None
+
+            try:
+                payload = res.json()
+                if not payload:
+                    break
+                if not isinstance(payload, list):
+                    return None
+                releases.extend(self.__normalize_plugin_release_response(payload))
+                if len(payload) < 100:
+                    break
+            except Exception as e:
+                logger.error(f"解析插件仓库 {repo_url} Release 列表失败：{e}")
+                return None
+        return releases
+
+    def get_plugin_release_versions(self, pid: str, repo_url: str) -> List[dict]:
+        """
+        获取插件可安装的 GitHub Release 版本列表。
+
+        GitHub 分页结果按仓库缓存，插件 ID 只参与本地过滤，避免同仓库重复分页。
+        """
+        if not pid or not repo_url:
+            return []
+        return self.__parse_plugin_release_response(pid, self._get_plugin_repo_releases(repo_url.rstrip("/")))
+
+    @staticmethod
+    def __has_installable_release_version(release_items: List[dict], release_version: str) -> bool:
+        """
+        指定版本必须来自已解析出的可安装 Release 列表，避免直接拼接任意 tag。
+        """
+        return any(item.get("version") == release_version for item in release_items)
 
     def get_plugin_package_version(self, pid: str, repo_url: str,
                                    package_version: Optional[str] = None) -> Optional[str]:
@@ -490,66 +616,8 @@ class PluginHelper(metaclass=WeakSingleton):
             return None, None
         return user, repo
 
-    @cached(maxsize=1, ttl=1800)
-    def get_statistic(self) -> Dict:
-        """
-        获取插件安装统计
-        """
-        if not settings.PLUGIN_STATISTIC_SHARE:
-            return {}
-        res = RequestUtils(proxies=settings.PROXY, timeout=10).get_res(self._install_statistic)
-        if res is not None and res.status_code == 200:
-            return res.json()
-        return {}
-
-    def install_reg(self, pid: str, repo_url: Optional[str] = None) -> bool:
-        """
-        安装插件统计
-        """
-        if not settings.PLUGIN_STATISTIC_SHARE:
-            return False
-        if not pid:
-            return False
-        install_reg_url = self._install_reg.format(pid=pid)
-        res = RequestUtils(
-            proxies=settings.PROXY,
-            content_type="application/json",
-            timeout=5
-        ).post(install_reg_url, json={
-            "plugin_id": pid,
-            "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
-        })
-        if res is not None and res.status_code == 200:
-            return True
-        return False
-
-    def install_report(self, items: Optional[List[Tuple[str, Optional[str]]]] = None) -> bool:
-        """
-        上报存量插件安装统计（批量）。支持上送 repo_url。
-        :param items: 可选，形如 [(plugin_id, repo_url), ...]；不传则回落到历史配置，仅上送 plugin_id。
-        """
-        if not settings.PLUGIN_STATISTIC_SHARE:
-            return False
-        payload_plugins = []
-        if items:
-            for pid, repo_url in items:
-                if pid:
-                    payload_plugins.append({
-                        "plugin_id": pid,
-                        "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
-                    })
-        else:
-            plugins = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins)
-            if not plugins:
-                return False
-            payload_plugins = [{"plugin_id": plugin, "repo_url": None} for plugin in plugins]
-        res = RequestUtils(proxies=settings.PROXY,
-                           content_type="application/json",
-                           timeout=5).post(self._install_report,
-                                           json={"plugins": payload_plugins})
-        return bool(res is not None and res.status_code == 200)
-
-    def install(self, pid: str, repo_url: str, package_version: Optional[str] = None, force_install: bool = False) \
+    def install(self, pid: str, repo_url: str, package_version: Optional[str] = None,
+                release_version: Optional[str] = None, force_install: bool = False) \
             -> Tuple[bool, str]:
         """
         安装插件，包括依赖安装和文件下载，相关资源支持自动降级策略
@@ -562,6 +630,7 @@ class PluginHelper(metaclass=WeakSingleton):
         :param pid: 插件 ID
         :param repo_url: 插件仓库地址
         :param package_version: 首选插件版本 (如 "v2", "v3")，如不指定则默认使用系统配置的版本
+        :param release_version: 指定安装的 release 资产版本；未指定时安装当前索引版本
         :param force_install: 是否强制安装插件，默认不启用，启用时不进行备份和恢复操作
         :return: (是否成功, 错误信息)
         """
@@ -598,12 +667,32 @@ class PluginHelper(metaclass=WeakSingleton):
         else:
             logger.debug(f"{pid} 从 package.{package_version}.json 中找到适用于当前版本的插件")
 
-        # 2. 决定安装方式（release 或 文件列表）并执行统一安装流程
+        # 2. 决定安装方式（release 或文件列表）并执行统一安装流程。
         meta = self.__get_plugin_meta(pid, repo_url, package_version)
-        # 是否release打包
+        # 是否使用 Release 打包。Release 缺失或资产不可用时仍保留文件列表兜底，
+        # 避免索引先发布、Actions 打包滞后导致插件短时间无法安装。
         is_release = meta.get("release")
         # 插件版本号
         plugin_version = meta.get("version")
+        if release_version:
+            if not is_release:
+                return False, f"{pid} 未声明 Release 安装，无法安装指定版本"
+            if not self.__has_installable_release_version(
+                    self.get_plugin_release_versions(pid, repo_url), release_version
+            ):
+                return False, f"{pid} 未找到可安装的 Release 版本：{release_version}"
+            if release_version == plugin_version:
+                compatible, message = self.check_plugin_system_version(meta)
+                if not compatible:
+                    logger.debug(f"{pid} 插件系统版本兼容性检查失败：{message}")
+                    return False, message
+            release_tag = f"{pid}_v{release_version}"
+
+            def prepare_selected_release() -> Tuple[bool, str]:
+                return self.__install_from_release(pid, user_repo, release_tag)
+
+            return self.__install_flow_sync(pid, force_install, prepare_selected_release, repo_url)
+
         compatible, message = self.check_plugin_system_version(meta)
         if not compatible:
             logger.debug(f"{pid} 插件系统版本兼容性检查失败：{message}")
@@ -617,13 +706,16 @@ class PluginHelper(metaclass=WeakSingleton):
 
             # 使用 release 进行安装
             def prepare_release() -> Tuple[bool, str]:
-                return self.__install_from_release(
-                    pid, user_repo, release_tag
-                )
+                ok, msg = self.__install_from_release(pid, user_repo, release_tag)
+                if ok:
+                    return True, msg
+                logger.warning(f"{pid} Release 安装失败，回退文件列表安装：{msg}")
+                self.__remove_old_plugin(pid)
+                return self.__prepare_content_via_filelist_sync(pid.lower(), user_repo, package_version)
 
             return self.__install_flow_sync(pid, force_install, prepare_release, repo_url)
         else:
-            # 如果 release_tag 不存在，说明插件没有发布版本，使用文件列表方式安装
+            # 未声明 release 打包的插件继续使用文件列表方式安装。
             def prepare_filelist() -> Tuple[bool, str]:
                 return self.__prepare_content_via_filelist_sync(pid.lower(), user_repo, package_version)
 
@@ -923,19 +1015,6 @@ class PluginHelper(metaclass=WeakSingleton):
         return list(dict.fromkeys(wheels_dirs))
 
     @staticmethod
-    def __build_pip_install_strategies(base_cmd: List[str]) -> List[Tuple[str, List[str]]]:
-        """
-        为 pip 命令构建统一的网络降级策略，避免不同安装路径各自拼接参数。
-        """
-        strategies = []
-        if settings.PIP_PROXY:
-            strategies.append(("镜像站", base_cmd + ["-i", settings.PIP_PROXY]))
-        if settings.PROXY_HOST:
-            strategies.append(("代理", base_cmd + ["--proxy", settings.PROXY_HOST]))
-        strategies.append(("直连", base_cmd))
-        return strategies
-
-    @staticmethod
     def __build_runtime_pip_command(*args: str) -> List[str]:
         """
         优先使用当前解释器同目录的 pip 入口，以便 uv-pip-compat 能接管兼容命令。
@@ -996,7 +1075,7 @@ class PluginHelper(metaclass=WeakSingleton):
             return roots
 
         try:
-            with open(requirements_file, "r", encoding="utf-8") as f:
+            with open(requirements_file, "r", encoding="utf-8", errors="replace") as f:
                 for raw_line in f:
                     line = raw_line.strip()
                     if not line or line.startswith("#"):
@@ -1198,7 +1277,7 @@ class PluginHelper(metaclass=WeakSingleton):
         """
         conflicts = []
         try:
-            with open(requirements_file, "r", encoding="utf-8") as f:
+            with open(requirements_file, "r", encoding="utf-8", errors="replace") as f:
                 for raw_line in f:
                     line = raw_line.strip()
                     if not line or line.startswith("#"):
@@ -1298,6 +1377,45 @@ class PluginHelper(metaclass=WeakSingleton):
         importlib.invalidate_caches()
 
     @classmethod
+    def __build_package_install_request(
+            cls,
+            requirements_file: Path,
+            find_links_dirs: Optional[List[Path]] = None,
+            constraints_file: Optional[Path] = None,
+            purpose: str = "plugin",
+    ) -> PackageInstallRequest:
+        """
+        将 MoviePilot 运行配置转换为 pip/uv 安装请求，统一缓存、镜像和代理语义。
+        """
+        return PackageInstallRequest(
+            requirements_file=requirements_file,
+            python_bin=Path(sys.executable),
+            find_links_dirs=find_links_dirs or [],
+            constraints_file=constraints_file,
+            config_dir=settings.CONFIG_PATH,
+            package_cache_root=settings.PACKAGE_CACHE_PATH,
+            pip_index_url=settings.PIP_PROXY or None,
+            proxy_url=settings.PROXY_HOST or None,
+            purpose=purpose,
+        )
+
+    @classmethod
+    def __repair_if_runtime_broken(cls, snapshot_file: Optional[Path] = None) -> Tuple[bool, str]:
+        """
+        安装失败后检查主运行环境；若已异常，先恢复主程序依赖再继续向上返回安装失败。
+        """
+        health_ok, health_message = cls.__run_runtime_healthcheck()
+        if health_ok:
+            return True, ""
+        repair_ok, repair_message = cls.__repair_main_runtime_dependencies(snapshot_file)
+        if not repair_ok:
+            return False, f"插件依赖安装失败后主运行环境异常，且恢复失败：{health_message}; {repair_message}"
+        restored, restored_message = cls.__run_runtime_healthcheck()
+        if not restored:
+            return False, f"插件依赖安装失败后主运行环境异常，恢复后仍异常：{restored_message}"
+        return True, "主运行环境已恢复"
+
+    @classmethod
     def __run_runtime_healthcheck(cls) -> Tuple[bool, str]:
         """
         安装完成后立即执行运行环境自检，尽量在插件加载前发现依赖图已被污染。
@@ -1329,15 +1447,19 @@ class PluginHelper(metaclass=WeakSingleton):
             return False, f"恢复依赖文件不存在：{repair_target}"
 
         last_error = ""
-        base_cmd = [sys.executable, "-m", "pip", "install", "-r", str(repair_target)]
-        for strategy_name, pip_command in cls.__build_pip_install_strategies(base_cmd):
-            logger.warning(f"[PIP] 运行环境异常，尝试使用策略：{strategy_name} 恢复{repair_desc}")
-            success, message = SystemUtils.execute_with_subprocess(pip_command)
+        request = cls.__build_package_install_request(repair_target, purpose="runtime-repair")
+        for strategy in build_package_install_strategies(request):
+            logger.warning(f"[PIP] 运行环境异常，尝试使用策略：{strategy.strategy_name} 恢复{repair_desc}")
+            success, message = SystemUtils.execute_with_subprocess(
+                strategy.command,
+                env=strategy.env,
+                safe_command=strategy.safe_log_command,
+            )
             if success:
                 cls.__refresh_import_system()
                 return True, message
             last_error = message
-            logger.error(f"[PIP] 使用策略：{strategy_name} 恢复{repair_desc}失败：{message}")
+            logger.error(f"[PIP] 使用策略：{strategy.strategy_name} 恢复{repair_desc}失败：{message}")
         return False, last_error or f"恢复{repair_desc}失败"
 
     @classmethod
@@ -1370,11 +1492,9 @@ class PluginHelper(metaclass=WeakSingleton):
             seen_dirs.add(candidate_key)
             resolved_dirs.append(candidate_path)
 
-        find_links_option = []
         if resolved_dirs:
             for local_wheels_dir in resolved_dirs:
                 logger.debug(f"[PIP] 发现可用的 wheels 目录: {local_wheels_dir}，将优先从本地安装。")
-                find_links_option.extend(["--find-links", str(local_wheels_dir)])
         else:
             logger.debug(f"[PIP] 未发现可用的 wheels 目录，将仅使用在线源。")
 
@@ -1393,23 +1513,32 @@ class PluginHelper(metaclass=WeakSingleton):
                 logger.error(f"[PIP] 创建运行环境约束文件失败：{e}")
                 return False, f"创建运行环境约束文件失败：{e}"
 
-        base_cmd = [sys.executable, "-m", "pip", "install"] + find_links_option
-        if constraints_file:
-            # 这里固定约束到主程序依赖的当前版本，避免共享 venv 被插件改写核心运行环境。
-            base_cmd.extend(["-c", str(constraints_file)])
-        base_cmd.extend(["-r", str(requirements_file)])
-        strategies = cls.__build_pip_install_strategies(base_cmd)
+        request = cls.__build_package_install_request(
+            requirements_file,
+            find_links_dirs=resolved_dirs,
+            constraints_file=constraints_file,
+            purpose="plugin",
+        )
+        strategies = build_package_install_strategies(request)
 
         try:
             # pip 会修改当前解释器的 site-packages，安装与缓存刷新必须串行，避免运行态模块被并发安装窗口污染。
             with cls._pip_install_lock:
                 loaded_modules_before_install = set(sys.modules.keys())
                 # 遍历策略进行安装
-                for strategy_name, pip_command in strategies:
-                    logger.debug(f"[PIP] 尝试使用策略：{strategy_name} 安装依赖，命令：{' '.join(pip_command)}")
-                    success, message = SystemUtils.execute_with_subprocess(pip_command)
+                last_error = ""
+                for strategy in strategies:
+                    logger.debug(
+                        f"[PIP] 尝试使用策略：{strategy.strategy_name} 安装依赖，"
+                        f"命令：{' '.join(strategy.safe_log_command)}"
+                    )
+                    success, message = SystemUtils.execute_with_subprocess(
+                        strategy.command,
+                        env=strategy.env,
+                        safe_command=strategy.safe_log_command,
+                    )
                     if success:
-                        logger.debug(f"[PIP] 策略：{strategy_name} 安装依赖成功，输出：{message}")
+                        logger.debug(f"[PIP] 策略：{strategy.strategy_name} 安装依赖成功，输出：{message}")
                         health_ok, health_message = cls.__run_runtime_healthcheck()
                         if not health_ok:
                             logger.error(f"[PIP] 依赖安装后运行环境自检失败：{health_message}")
@@ -1441,11 +1570,22 @@ class PluginHelper(metaclass=WeakSingleton):
                         logger.debug(f"[PIP] 已刷新导入系统，新加载的模块: {loaded_modules_during_install}")
                         return True, message
 
-                    logger.error(f"[PIP] 策略：{strategy_name} 安装依赖失败，错误信息：{message}")
+                    last_error = message
+                    repair_ok, repair_message = cls.__repair_if_runtime_broken(
+                        constraints_file if protected_packages else None
+                    )
+                    logger.error(f"[PIP] 策略：{strategy.strategy_name} 安装依赖失败，错误信息：{message}")
+                    if not repair_ok or repair_message:
+                        return False, (
+                            f"策略 {strategy.strategy_name} 安装依赖失败：{message}；"
+                            f"{repair_message}"
+                        )
         finally:
             if constraints_file:
                 constraints_file.unlink(missing_ok=True)
 
+        if last_error:
+            return False, f"[PIP] 所有策略均安装依赖失败：{last_error}"
         return False, "[PIP] 所有策略均安装依赖失败，请检查网络连接、PIP 配置或插件依赖约束"
 
     @staticmethod
@@ -1580,7 +1720,6 @@ class PluginHelper(metaclass=WeakSingleton):
                 logger.warn(f"{pid} 已清理对应插件目录，请尝试重新安装")
             return False, dep_msg
 
-        self.install_reg(pid, repo_url)
         self.refresh_persistent_plugin_backup(pid)
         return True, ""
 
@@ -1800,7 +1939,7 @@ class PluginHelper(metaclass=WeakSingleton):
         """
         dependencies = {}
         try:
-            with open(requirements_file, "r", encoding="utf-8") as f:
+            with open(requirements_file, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#'):
@@ -1934,6 +2073,7 @@ class PluginHelper(metaclass=WeakSingleton):
 
         raw_url = self._base_url.format(user=user, repo=repo)
         package_url = f"{raw_url}package.{package_version}.json" if package_version else f"{raw_url}package.json"
+        package_url = self.__append_cache_buster(package_url)
 
         res = await self.__async_request_with_fallback(package_url,
                                                        headers=settings.REPO_GITHUB_HEADERS(repo=f"{user}/{repo}"))
@@ -1945,63 +2085,108 @@ class PluginHelper(metaclass=WeakSingleton):
             return None
         return self.__parse_plugin_index_response(res.text)
 
-    async def async_get_statistic(self) -> Dict:
+    @cached(maxsize=32, ttl=1800, shared_key="get_plugin_repo_releases")
+    async def _async_get_plugin_repo_releases(self, repo_url: str) -> Optional[List[dict]]:
         """
-        异步获取插件安装统计
+        异步按仓库获取 GitHub Release 原始分页数据。
         """
-        if not settings.PLUGIN_STATISTIC_SHARE:
-            return {}
-        res = await AsyncRequestUtils(proxies=settings.PROXY, timeout=10).get_res(self._install_statistic)
-        if res is not None and res.status_code == 200:
-            return res.json()
-        return {}
+        if not repo_url:
+            return []
 
-    async def async_install_reg(self, pid: str, repo_url: Optional[str] = None) -> bool:
-        """
-        异步安装插件统计
-        """
-        if not settings.PLUGIN_STATISTIC_SHARE:
-            return False
-        if not pid:
-            return False
-        install_reg_url = self._install_reg.format(pid=pid)
-        res = await AsyncRequestUtils(
-            proxies=settings.PROXY,
-            content_type="application/json",
-            timeout=5
-        ).post(install_reg_url, json={
-            "plugin_id": pid,
-            "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
-        })
-        if res is not None and res.status_code == 200:
-            return True
-        return False
+        user, repo = self.get_repo_info(repo_url)
+        if not user or not repo:
+            return []
 
-    async def async_install_report(self, items: Optional[List[Tuple[str, Optional[str]]]] = None) -> bool:
+        user_repo = f"{user}/{repo}"
+        releases = []
+        for page in range(1, 11):
+            release_api = f"https://api.github.com/repos/{user_repo}/releases?per_page=100&page={page}"
+            release_api = self.__append_cache_buster(release_api)
+            res = await self.__async_request_with_fallback(
+                release_api,
+                headers=settings.REPO_GITHUB_HEADERS(repo=user_repo),
+                timeout=30,
+                is_api=True,
+            )
+            if res is None or res.status_code != 200:
+                return None
+
+            try:
+                payload = res.json()
+                if not payload:
+                    break
+                if not isinstance(payload, list):
+                    return None
+                releases.extend(self.__normalize_plugin_release_response(payload))
+                if len(payload) < 100:
+                    break
+            except Exception as e:
+                logger.error(f"解析插件仓库 {repo_url} Release 列表失败：{e}")
+                return None
+        return releases
+
+    async def async_get_plugin_release_versions(self, pid: str, repo_url: str) -> List[dict]:
         """
-        异步上报存量插件安装统计（批量）。支持上送 repo_url。
-        :param items: 可选，形如 [(plugin_id, repo_url), ...]；不传则回落到历史配置，仅上送 plugin_id。
+        异步获取插件可安装的 GitHub Release 版本列表。
+
+        同一事件循环内，同仓库的并发读取和强制刷新共享一个请求任务。
         """
-        if not settings.PLUGIN_STATISTIC_SHARE:
-            return False
-        payload_plugins = []
-        if items:
-            for pid, repo_url in items:
-                if pid:
-                    payload_plugins.append({
-                        "plugin_id": pid,
-                        "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
-                    })
-        else:
-            plugins = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins)
-            if not plugins:
-                return False
-            payload_plugins = [{"plugin_id": plugin, "repo_url": None} for plugin in plugins]
-        res = await AsyncRequestUtils(proxies=settings.PROXY,
-                                      content_type="application/json",
-                                      timeout=5).post(self._install_report,
-                                                      json={"plugins": payload_plugins})
-        return bool(res is not None and res.status_code == 200)
+        if not pid or not repo_url:
+            return []
+
+        loop = asyncio.get_running_loop()
+        normalized_repo_url = repo_url.rstrip("/")
+        normal_task_key = (loop, normalized_repo_url, False)
+        force_task_key = (loop, normalized_repo_url, True)
+        with self._release_task_lock:
+            force_task = self._release_tasks.get(force_task_key)
+            if force_task and not force_task.done():
+                task_key = force_task_key
+                task = force_task
+            elif is_fresh():
+                pending_normal_task = self._release_tasks.get(normal_task_key)
+                if pending_normal_task and pending_normal_task.done():
+                    pending_normal_task = None
+                task_key = force_task_key
+                task = loop.create_task(
+                    self._async_refresh_plugin_repo_releases(normalized_repo_url, pending_normal_task)
+                )
+                self._release_tasks[task_key] = task
+                task.add_done_callback(
+                    lambda completed_task: self._remove_release_task(task_key, completed_task)
+                )
+            else:
+                task_key = normal_task_key
+                task = self._release_tasks.get(task_key)
+                if task is None or task.done():
+                    task = loop.create_task(self._async_get_plugin_repo_releases(normalized_repo_url))
+                    self._release_tasks[task_key] = task
+                    task.add_done_callback(
+                        lambda completed_task: self._remove_release_task(task_key, completed_task)
+                    )
+
+        payload = await asyncio.shield(task)
+        return self.__parse_plugin_release_response(pid, payload)
+
+    async def _async_refresh_plugin_repo_releases(
+        self,
+        repo_url: str,
+        pending_normal_task: Optional[asyncio.Task],
+    ) -> Optional[List[dict]]:
+        """等待在途普通读取落盘后执行强刷，确保旧结果不会覆盖强刷缓存。"""
+        if pending_normal_task:
+            try:
+                await asyncio.shield(pending_normal_task)
+            except (Exception, asyncio.CancelledError):
+                pass
+        return await self._async_get_plugin_repo_releases(repo_url)
+
+    @classmethod
+    def _remove_release_task(cls, task_key: Tuple[asyncio.AbstractEventLoop, str, bool], task: asyncio.Task) -> None:
+        """请求任务完成后释放事件循环和仓库引用。"""
+        with cls._release_task_lock:
+            if cls._release_tasks.get(task_key) is task:
+                cls._release_tasks.pop(task_key, None)
 
     async def __async_get_file_list(self, pid: str, user_repo: str, package_version: Optional[str] = None) -> \
             Tuple[Optional[list], Optional[str]]:
@@ -2304,7 +2489,7 @@ class PluginHelper(metaclass=WeakSingleton):
         """
         dependencies = {}
         try:
-            async with aiofiles.open(requirements_file, "r", encoding="utf-8") as f:
+            async with aiofiles.open(requirements_file, "r", encoding="utf-8", errors="replace") as f:
                 async for line in f:
                     line = str(line).strip()
                     if line and not line.startswith('#'):
@@ -2361,6 +2546,7 @@ class PluginHelper(metaclass=WeakSingleton):
             return []
 
     async def async_install(self, pid: str, repo_url: str, package_version: Optional[str] = None,
+                            release_version: Optional[str] = None,
                             force_install: bool = False) -> Tuple[bool, str]:
         """
         异步安装插件，包括依赖安装和文件下载，相关资源支持自动降级策略
@@ -2373,6 +2559,7 @@ class PluginHelper(metaclass=WeakSingleton):
         :param pid: 插件 ID
         :param repo_url: 插件仓库地址
         :param package_version: 首选插件版本 (如 "v2", "v3")，如不指定则默认使用系统配置的版本
+        :param release_version: 指定安装的 release 资产版本；未指定时安装当前索引版本
         :param force_install: 是否强制安装插件，默认不启用，启用时不进行备份和恢复操作
         :return: (是否成功, 错误信息)
         """
@@ -2409,12 +2596,30 @@ class PluginHelper(metaclass=WeakSingleton):
         else:
             logger.debug(f"{pid} 从 package.{package_version}.json 中找到适用于当前版本的插件")
 
-        # 2. 统一异步安装流程（release 或 文件列表）
+        # 2. 统一异步安装流程（release 或文件列表）。
         meta = await self.__async_get_plugin_meta(pid, repo_url, package_version)
-        # 是否release打包
+        # 是否使用 Release 打包；失败时兜底文件列表，保持同步/异步安装语义一致。
         is_release = meta.get("release")
         # 插件版本号
         plugin_version = meta.get("version")
+        if release_version:
+            if not is_release:
+                return False, f"{pid} 未声明 Release 安装，无法安装指定版本"
+            release_items = await self.async_get_plugin_release_versions(pid, repo_url)
+            if not self.__has_installable_release_version(release_items, release_version):
+                return False, f"{pid} 未找到可安装的 Release 版本：{release_version}"
+            if release_version == plugin_version:
+                compatible, message = self.check_plugin_system_version(meta)
+                if not compatible:
+                    logger.debug(f"{pid} 插件系统版本兼容性检查失败：{message}")
+                    return False, message
+            release_tag = f"{pid}_v{release_version}"
+
+            async def prepare_selected_release() -> Tuple[bool, str]:
+                return await self.__async_install_from_release(pid, user_repo, release_tag)
+
+            return await self.__install_flow_async(pid, force_install, prepare_selected_release, repo_url)
+
         compatible, message = self.check_plugin_system_version(meta)
         if not compatible:
             logger.debug(f"{pid} 插件系统版本兼容性检查失败：{message}")
@@ -2428,15 +2633,18 @@ class PluginHelper(metaclass=WeakSingleton):
 
             # 使用 release 进行安装
             async def prepare_release() -> Tuple[bool, str]:
-                return await self.__async_install_from_release(
-                    pid, user_repo, release_tag
-                )
+                ok, msg = await self.__async_install_from_release(pid, user_repo, release_tag)
+                if ok:
+                    return True, msg
+                logger.warning(f"{pid} Release 安装失败，回退文件列表安装：{msg}")
+                await self.__async_remove_old_plugin(pid)
+                return await self.__prepare_content_via_filelist_async(pid.lower(), user_repo, package_version)
 
             return await self.__install_flow_async(pid, force_install, prepare_release, repo_url)
         else:
-            # 如果没有 release_tag，则使用文件列表安装方式
+            # 未声明 release 打包的插件继续使用文件列表方式安装。
             async def prepare_filelist() -> Tuple[bool, str]:
-                return await self.__prepare_content_via_filelist_async(pid, user_repo, package_version)
+                return await self.__prepare_content_via_filelist_async(pid.lower(), user_repo, package_version)
 
             return await self.__install_flow_async(pid, force_install, prepare_filelist, repo_url)
 
@@ -2487,7 +2695,6 @@ class PluginHelper(metaclass=WeakSingleton):
                 logger.warn(f"{pid} 已清理对应插件目录，请尝试重新安装")
             return False, dep_msg
 
-        await self.async_install_reg(pid, repo_url)
         await asyncio.to_thread(self.refresh_persistent_plugin_backup, pid)
         return True, ""
 
@@ -2608,3 +2815,10 @@ class PluginHelper(metaclass=WeakSingleton):
         except Exception as e:
             logger.error(f"解压 Release 压缩包失败：{e}")
             return False, f"解压 Release 压缩包失败：{e}"
+
+
+# 公开 Release 查询的缓存管理统一指向仓库级分页缓存。
+PluginHelper.get_plugin_release_versions.cache_clear = PluginHelper._get_plugin_repo_releases.cache_clear
+PluginHelper.get_plugin_release_versions.cache_region = PluginHelper._get_plugin_repo_releases.cache_region
+PluginHelper.async_get_plugin_release_versions.cache_clear = PluginHelper._async_get_plugin_repo_releases.cache_clear
+PluginHelper.async_get_plugin_release_versions.cache_region = PluginHelper._async_get_plugin_repo_releases.cache_region

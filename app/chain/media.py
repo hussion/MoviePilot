@@ -84,13 +84,12 @@ class ScrapingOption:
 class ScrapingConfig:
     """媒体刮削配置"""
 
-    _policies: dict[tuple[str], ScrapingOption] = {}
-
     def __init__(self, config_dict: dict[str, str] = None):
         """
         初始化配置对象
         :param config_dict: 用户配置字典（扁平化格式），为 None 时使用默认配置
         """
+        self._policies: dict[tuple[str, str], ScrapingOption] = {}
         # 合并用户配置和默认配置
         if config_dict is None:
             config_dict = {}
@@ -184,6 +183,20 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         self.scraping_policies = ScrapingConfig.from_system_config()
 
     @staticmethod
+    def _cleanup_temp_file(path: Optional[Path]):
+        """
+        清理临时刮削文件
+
+        :param path: 临时文件路径
+        """
+        if not path or not path.exists():
+            return
+        try:
+            path.unlink()
+        except OSError as err:
+            logger.warn(f"临时文件清理失败：{path} - {err}")
+
+    @staticmethod
     def _should_scrape(
             scraping_option: ScrapingOption,
             file_exists: bool,
@@ -232,18 +245,17 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """
         if not fileitem or not content or not path:
             return
-        # 使用tempfile创建临时文件
-        with NamedTemporaryFile(
-                delete=True, delete_on_close=False, suffix=path.suffix
-        ) as tmp_file:
-            tmp_file_path = Path(tmp_file.name)
-            # 写入内容
-            if isinstance(content, bytes):
-                tmp_file.write(content)
-            else:
-                tmp_file.write(content.encode("utf-8"))
-            tmp_file.flush()
-            tmp_file.close()  # 关闭文件句柄
+        tmp_file_path = None
+        try:
+            # delete_on_close 是 Python 3.12 才支持的参数，使用 delete=False 后手动清理以兼容低版本。
+            with NamedTemporaryFile(delete=False, suffix=path.suffix) as tmp_file:
+                tmp_file_path = Path(tmp_file.name)
+                # 写入内容
+                if isinstance(content, bytes):
+                    tmp_file.write(content)
+                else:
+                    tmp_file.write(content.encode("utf-8"))
+                tmp_file.flush()
 
             # 刮削文件只需要读写权限
             tmp_file_path.chmod(0o666 & ~current_umask)
@@ -256,6 +268,8 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 logger.info(f"已保存文件：{item.path}")
             else:
                 logger.warn(f"文件保存失败：{path}")
+        finally:
+            self._cleanup_temp_file(tmp_file_path)
 
     def _download_and_save_image(
             self, fileitem: schemas.FileItem, path: Path, url: str
@@ -276,17 +290,16 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             )
             with request_utils.get_stream(url=url) as r:
                 if r and r.status_code == 200:
-                    # 使用tempfile创建临时文件，自动删除
-                    with NamedTemporaryFile(
-                            delete=True, delete_on_close=False, suffix=path.suffix
-                    ) as tmp_file:
-                        tmp_file_path = Path(tmp_file.name)
-                        # 流式写入文件
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if chunk:
-                                tmp_file.write(chunk)
-                        tmp_file.flush()
-                        tmp_file.close()  # 关闭文件句柄
+                    tmp_file_path = None
+                    try:
+                        # delete_on_close 是 Python 3.12 才支持的参数，使用 delete=False 后手动清理以兼容低版本。
+                        with NamedTemporaryFile(delete=False, suffix=path.suffix) as tmp_file:
+                            tmp_file_path = Path(tmp_file.name)
+                            # 流式写入文件
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if chunk:
+                                    tmp_file.write(chunk)
+                            tmp_file.flush()
 
                         # 刮削的图片只需要读写权限
                         tmp_file_path.chmod(0o666 & ~current_umask)
@@ -299,6 +312,8 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                             logger.info(f"已保存图片：{item.path}")
                         else:
                             logger.warn(f"图片保存失败：{path}")
+                    finally:
+                        self._cleanup_temp_file(tmp_file_path)
                 else:
                     logger.info(f"{url} 图片下载失败")
         except Exception as err:
@@ -556,20 +571,20 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         plugin_available = eventmanager.check(ChainEventType.NameRecognize)
         if settings.RECOGNIZE_PLUGIN_FIRST and plugin_available:
             # 插件优先
-            logger.info(f"插件优先模式已开启。请求辅助识别，标题：{log_name} ...")
+            logger.info(f"插件识别优先模式已开启。请求辅助识别，标题：{log_name} ...")
             mediainfo = plugin_fn()
             if not mediainfo:
                 logger.info(
-                    f"辅助识别未识别到 {log_context} 的媒体信息，尝试使用原生识别"
+                    f"辅助识别未识别到 {log_context} 的媒体信息，尝试使用原生识别 ..."
                 )
                 mediainfo = native_fn()
         else:
             # 原生优先
-            logger.info(f"插件优先模式未开启。尝试原生识别，标题：{log_name} ...")
+            logger.info(f"开始识别标题：{log_name} ...")
             mediainfo = native_fn()
             if not mediainfo and plugin_available:
                 logger.info(
-                    f"原生识别未识别到 {log_context} 的媒体信息，尝试使用辅助识别"
+                    f"未识别到 {log_context} 的媒体信息，尝试使用辅助识别 ..."
                 )
                 mediainfo = plugin_fn()
         return mediainfo

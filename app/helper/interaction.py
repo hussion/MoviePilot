@@ -197,6 +197,9 @@ def update_or_post_message(
             and original_chat_id
             and ChannelCapabilityManager.supports_editing(channel)
     ):
+        edit_kwargs = {}
+        if channel == MessageChannel.WebAgent:
+            edit_kwargs["metadata"] = {"userid": userid}
         edited = chain.edit_message(
             channel=channel,
             source=source,
@@ -205,6 +208,7 @@ def update_or_post_message(
             title=title,
             text=text,
             buttons=buttons,
+            **edit_kwargs,
         )
         if edited:
             return
@@ -218,6 +222,7 @@ def update_or_post_message(
             title=title,
             text=text,
             buttons=buttons,
+            save_history=False,
         )
     )
 
@@ -271,6 +276,11 @@ class PendingMediaInteraction:
     meta: Optional[MetaBase] = None
     current_media: Optional[MediaInfo] = None
     items: List[Any] = field(default_factory=list)
+    download_dirs: List[Any] = field(default_factory=list)
+    pending_download_mode: Optional[str] = None
+    pending_download_context: Optional[Any] = None
+    pending_no_exists: Optional[Dict[Any, Any]] = None
+    pending_torrent_page: int = 0
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -396,6 +406,7 @@ class AgentInteractionOption:
 
     label: str
     value: str
+    description: Optional[str] = None
 
 
 @dataclass

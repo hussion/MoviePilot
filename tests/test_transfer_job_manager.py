@@ -265,6 +265,81 @@ class TransferJobManagerTest(unittest.TestCase):
         self.assertEqual(target_item, transferinfo.target_item)
         self.assertEqual(target_folder, transferinfo.target_diritem)
 
+    def test_single_file_transfer_intercept_event_carries_file_meta(self):
+        """
+        单文件整理拦截事件应携带元数据，便于事件处理器按季集匹配。
+        """
+        handler = TransHandler()
+        source_item = FileItem(
+            storage="alist",
+            path="/downloads/Test.Show.S02E03.mkv",
+            type="file",
+            name="Test.Show.S02E03.mkv",
+            basename="Test.Show.S02E03",
+            extension="mkv",
+            size=1024,
+            modify_time=1715939275.0,
+        )
+        target_path = Path("/library")
+        target_file = Path("/library/Test.Show.S02E03.mkv")
+        target_folder = FileItem(
+            storage="alist",
+            type="dir",
+            path="/library/",
+            name="library",
+            basename="library",
+        )
+        target_item = FileItem(
+            storage="alist",
+            path=target_file.as_posix(),
+            type="file",
+            name=target_file.name,
+            basename=target_file.stem,
+            extension="mkv",
+            size=1024,
+        )
+        source_oper = SimpleNamespace(
+            is_support_transtype=lambda transfer_type: True,
+            move=lambda fileitem, path, name: True,
+        )
+        target_oper = SimpleNamespace(
+            get_folder=lambda path: target_folder,
+            get_item=lambda path: None,
+        )
+        in_meta = MetaVideo("Test.Show.S02E03")
+
+        with patch.object(
+                TransHandler, "get_rename_path", return_value=target_file
+        ), patch(
+                "app.modules.filemanager.transhandler.DirectoryHelper.get_media_root_path",
+                return_value=Path("/library"),
+        ), patch.object(
+                TransHandler,
+                "_TransHandler__transfer_command",
+                return_value=(target_item, ""),
+        ), patch(
+                "app.modules.filemanager.transhandler.eventmanager.send_event",
+                return_value=None,
+        ) as send_event:
+            transferinfo = handler.transfer_media(
+                fileitem=source_item,
+                in_meta=in_meta,
+                mediainfo=make_media_info(),
+                target_storage="alist",
+                target_path=target_path,
+                transfer_type="move",
+                source_oper=source_oper,
+                target_oper=target_oper,
+                need_scrape=True,
+                need_notify=True,
+            )
+
+        self.assertTrue(transferinfo.success)
+        event_data = send_event.call_args.args[1]
+        self.assertIs(in_meta, event_data.meta)
+        self.assertEqual(2, event_data.meta.begin_season)
+        self.assertEqual(3, event_data.meta.begin_episode)
+
     def test_success_callback_uses_transfer_result_target_diritem(self):
         """
         回调发送刮削事件时应直接使用整理结果里的目标目录项。
@@ -616,7 +691,7 @@ class TransferJobManagerTest(unittest.TestCase):
         self.assertEqual([("abc123", "qbittorrent")], completed)
         self.assertEqual([], chain.jobview.list_jobs())
 
-    def test_do_transfer_does_not_sync_extra_files_by_default(self):
+    def test_do_transfer_syncs_same_stem_extra_files_by_default(self):
         chain = make_transfer_chain()
         planned = []
         main_fileitem = make_fileitem(
@@ -680,7 +755,198 @@ class TransferJobManagerTest(unittest.TestCase):
 
         self.assertTrue(state)
         self.assertEqual("", errmsg)
-        self.assertEqual([main_fileitem.path], planned)
+        self.assertEqual(
+            [
+                main_fileitem.path,
+                subtitle_fileitem.path,
+            ],
+            planned,
+        )
+
+    def test_manual_transfer_enables_sync_extra_files(self):
+        chain = make_transfer_chain()
+        captured = {}
+        fileitem = make_fileitem("/downloads/Test Show (2026)/Test.Show.S01E01.2026.mkv")
+
+        def fake_do_transfer(**kwargs):
+            captured.update(kwargs)
+            return True, ""
+
+        chain.do_transfer = fake_do_transfer
+
+        state, errmsg = TransferChain.manual_transfer(
+            chain,
+            fileitem=fileitem,
+            preview=True,
+        )
+
+        self.assertTrue(state)
+        self.assertEqual("", errmsg)
+        self.assertTrue(captured["manual"])
+        self.assertTrue(captured["sync_extra_files"])
+
+    def test_manual_transfer_respects_sync_extra_files_argument(self):
+        chain = make_transfer_chain()
+        captured = {}
+        fileitem = make_fileitem("/downloads/Test Show (2026)/Test.Show.S01E01.2026.mkv")
+
+        def fake_do_transfer(**kwargs):
+            captured.update(kwargs)
+            return True, ""
+
+        chain.do_transfer = fake_do_transfer
+
+        state, errmsg = TransferChain.manual_transfer(
+            chain,
+            fileitem=fileitem,
+            preview=True,
+            sync_extra_files=False,
+        )
+
+        self.assertTrue(state)
+        self.assertEqual("", errmsg)
+        self.assertFalse(captured["sync_extra_files"])
+
+    def test_do_transfer_skips_manual_single_file_when_epformat_misses(self):
+        chain = make_transfer_chain()
+        planned = []
+        subtitle_fileitem = make_fileitem(
+            "/downloads/Test Show (2026)/Show - 01.sc.ass"
+        )
+
+        chain._TransferChain__put_to_jobview = lambda task: True
+        chain._TransferChain__register_scrape_batch_task = lambda task: None
+        chain._TransferChain__close_scrape_batch = lambda batch_id: None
+
+        def fake_handle_transfer(task, callback=None):
+            planned.append((task.fileitem.path, task.meta.begin_episode))
+            return True, ""
+
+        chain._TransferChain__handle_transfer = fake_handle_transfer
+        transfer_history_oper = SimpleNamespace(get_by_src=lambda src, storage=None: None)
+        download_history_oper = SimpleNamespace(
+            get_by_hash=lambda download_hash: None,
+            get_file_by_fullpath=lambda fullpath: None,
+            get_files_by_savepath=lambda savepath: [],
+            get_by_path=lambda path: None,
+        )
+        system_config_oper = SimpleNamespace(get=lambda key: None)
+        storage_chain = SimpleNamespace(get_item=lambda fileitem: subtitle_fileitem)
+
+        with patch(
+            "app.chain.transfer.TransferHistoryOper",
+            return_value=transfer_history_oper,
+        ), patch(
+            "app.chain.transfer.DownloadHistoryOper",
+            return_value=download_history_oper,
+        ), patch(
+            "app.chain.transfer.SystemConfigOper",
+            return_value=system_config_oper,
+        ), patch(
+            "app.chain.transfer.StorageChain",
+            return_value=storage_chain,
+        ), patch(
+            "app.chain.transfer.MetaInfoPath",
+            side_effect=lambda path, custom_words=None: FakeMeta(1),
+        ):
+            state, errmsg = TransferChain.do_transfer(
+                chain,
+                fileitem=subtitle_fileitem,
+                background=False,
+                manual=True,
+                preview=True,
+                sync_extra_files=True,
+                epformat=EpisodeFormat(format="Show - {ep}.mkv"),
+            )
+
+        self.assertTrue(state)
+        self.assertEqual(
+            {
+                "summary": {"total": 0, "success": 0, "failed": 0},
+                "items": [],
+                "message": "",
+            },
+            errmsg,
+        )
+        self.assertEqual([], planned)
+
+    def test_do_transfer_syncs_extra_files_when_epformat_only_matches_main_video(self):
+        chain = make_transfer_chain()
+        planned = []
+        main_fileitem = make_fileitem(
+            "/downloads/Test Show (2026)/Show - 01.mkv"
+        )
+        subtitle_fileitem = make_fileitem(
+            "/downloads/Test Show (2026)/Show - 01.sc.ass"
+        )
+        parent_fileitem = FileItem(
+            storage="local",
+            path="/downloads/Test Show (2026)/",
+            type="dir",
+            name="Test Show (2026)",
+        )
+
+        chain._TransferChain__get_trans_fileitems = lambda fileitem, predicate: [
+            (main_fileitem, False)
+        ]
+        chain._TransferChain__put_to_jobview = lambda task: True
+        chain._TransferChain__register_scrape_batch_task = lambda task: None
+        chain._TransferChain__close_scrape_batch = lambda batch_id: None
+
+        def fake_handle_transfer(task, callback=None):
+            planned.append((task.fileitem.path, task.meta.begin_episode))
+            return True, ""
+
+        chain._TransferChain__handle_transfer = fake_handle_transfer
+        transfer_history_oper = SimpleNamespace(get_by_src=lambda src, storage=None: None)
+        download_history_oper = SimpleNamespace(
+            get_by_hash=lambda download_hash: None,
+            get_file_by_fullpath=lambda fullpath: None,
+            get_files_by_savepath=lambda savepath: [],
+            get_by_path=lambda path: None,
+        )
+        system_config_oper = SimpleNamespace(get=lambda key: None)
+        storage_chain = SimpleNamespace(
+            get_parent_item=lambda fileitem: parent_fileitem,
+            list_files=lambda fileitem, recursion=False: [
+                main_fileitem,
+                subtitle_fileitem,
+            ],
+        )
+
+        with patch(
+            "app.chain.transfer.TransferHistoryOper",
+            return_value=transfer_history_oper,
+        ), patch(
+            "app.chain.transfer.DownloadHistoryOper",
+            return_value=download_history_oper,
+        ), patch(
+            "app.chain.transfer.SystemConfigOper",
+            return_value=system_config_oper,
+        ), patch(
+            "app.chain.transfer.StorageChain",
+            return_value=storage_chain,
+        ), patch(
+            "app.chain.transfer.MetaInfoPath",
+            side_effect=lambda path, custom_words=None: FakeMeta(1),
+        ):
+            state, errmsg = TransferChain.do_transfer(
+                chain,
+                fileitem=main_fileitem,
+                background=False,
+                manual=True,
+                sync_extra_files=True,
+                epformat=EpisodeFormat(format="Show - {ep}.mkv"),
+            )
+
+        self.assertTrue(state)
+        self.assertEqual("", errmsg)
+        self.assertEqual(
+            [
+                (main_fileitem.path, 1),
+            ],
+            planned,
+        )
 
     def test_do_transfer_syncs_matching_extra_files_for_each_main_video(self):
         chain = make_transfer_chain()
@@ -778,10 +1044,11 @@ class TransferJobManagerTest(unittest.TestCase):
         self.assertEqual(
             [
                 (main_ep1_fileitem.path, 1),
-                (main_ep2_fileitem.path, 2),
                 (ep1_subtitle_fileitem.path, 1),
                 (ep1_audio_fileitem.path, 1),
+                (main_ep2_fileitem.path, 2),
                 (ep2_subtitle_fileitem.path, 2),
+                (other_title_fileitem.path, 1),
             ],
             planned,
         )
@@ -935,6 +1202,3 @@ class TransferJobManagerTest(unittest.TestCase):
             ["/library/Test Show (2026)/Season 1/Test.Show.S01E01.mkv"],
             event_data["file_list"],
         )
-
-if __name__ == "__main__":
-    unittest.main()

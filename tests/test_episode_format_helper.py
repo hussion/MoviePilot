@@ -68,6 +68,39 @@ def test_locate_episode_supports_hash_prefix():
     assert file_name[start - 1] == "#"
 
 
+@pytest.mark.parametrize(
+    "file_name",
+    [
+        "Show 01《Title》.mkv",
+        "Show 01〈Title〉.mkv",
+        "Show 01〔Title〕.mkv",
+    ],
+)
+def test_locate_episode_supports_east_asian_title_quotes(file_name: str):
+    helper = EpisodeFormatRuleHelper()
+
+    start, end = helper._locate_episode(file_name, "01")
+
+    assert file_name[start:end] == "01"
+
+
+def test_auto_recommend_supports_episode_before_japanese_quote():
+    helper = EpisodeFormatRuleHelper()
+    samples = [
+        _make_file("[U2-Rip]バカとテストと召喚獣 01「バカとクラスと召喚戦爭」(BD 1920x1080 x264 FLACx2).mkv"),
+        _make_file("[U2-Rip]バカとテストと召喚獣 02「ユリとバラと保健体育」(BD 1920x1080 x264 FLACx2).mkv"),
+        _make_file("[U2-Rip]バカとテストと召喚獣 03「食費とデートとスタンガン」(BD 1920x1080 x264 FLACx2).mkv"),
+    ]
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is True
+    assert errmsg == ""
+    assert data["episode_format"] == "[U2-Rip]バカとテストと召喚獣 {ep}「{a}」(BD 1920x1080 x264 FLACx2).mkv"
+    assert data["sample_count"] == 3
+    assert data["majority_count"] == 3
+
+
 def test_auto_recommend_returns_low_confidence_for_single_sample():
     helper = EpisodeFormatRuleHelper()
     sample = _make_file("[Seed-Raws] Tari Tari - 01 (BD 1280x720 AVC AAC).mp4")
@@ -200,7 +233,7 @@ def test_auto_recommend_returns_false_when_parse_raises(monkeypatch):
     def _raise_parse(*args, **kwargs):
         raise ValueError("broken parse")
 
-    monkeypatch.setattr("app.helper.format.parse.parse", _raise_parse)
+    monkeypatch.setattr("app.helper.format._match_template", _raise_parse)
 
     state, errmsg, data = helper.recommend([], samples)
 
@@ -350,6 +383,47 @@ def test_auto_recommend_ignores_special_sp_samples():
     assert data["episode_format"] == "[Tonikaku Kawaii S2][{ep}][BDRIP][1080P][H264_FLAC].mkv"
 
 
+def test_auto_recommend_ignores_promotional_special_samples():
+    helper = EpisodeFormatRuleHelper()
+    sample_names = [
+        "[VCB-Studio] Show [01][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [02][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [03][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [PV01][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [CM01][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [Trailer][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [Web Preview 02][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [Series Review][Ma10p_1080p][x265_flac].mkv",
+        "[VCB-Studio] Show [Table Game][Ma10p_1080p][x265_flac].mkv",
+    ]
+    samples = [_make_file(name) for name in sample_names]
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is True
+    assert errmsg == ""
+    assert data["sample_count"] == 3
+    assert data["majority_count"] == 3
+    assert data["episode_format"] == "[VCB-Studio] Show [{ep}][Ma10p_1080p][x265_flac].mkv"
+
+
+def test_auto_recommend_rejects_when_valid_media_coverage_is_too_low():
+    helper = EpisodeFormatRuleHelper()
+    sample_names = [
+        "Show - 01.mkv",
+        "Show - 02.mkv",
+        "Show bonus.mkv",
+        "Show extra.mkv",
+    ]
+    samples = [_make_file(name) for name in sample_names]
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is False
+    assert errmsg == "有效正片样本覆盖率不足，建议补充集数定位规则"
+    assert data is None
+
+
 def test_auto_recommend_uses_native_episode_as_fallback(monkeypatch):
     helper = EpisodeFormatRuleHelper()
     samples = [
@@ -401,6 +475,180 @@ def test_auto_recommend_rejects_when_native_episode_conflicts(monkeypatch):
     assert state is False
     assert errmsg == "样本命名与原生识别结果冲突，建议补充集数定位规则"
     assert data is None
+
+
+def test_auto_recommend_degrades_native_conflict_for_title_sequence_number(monkeypatch):
+    helper = EpisodeFormatRuleHelper()
+    samples = [
+        _make_file("[VCB-Studio] Getsuyoubi no Tawawa 2 [01][Ma10p_1080p][x265_flac].mkv"),
+        _make_file("[VCB-Studio] Getsuyoubi no Tawawa 2 [02][Ma10p_1080p][x265_flac].mkv"),
+    ]
+
+    monkeypatch.setattr(
+        helper,
+        "_extract_native_episode",
+        lambda item: "2",
+    )
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is True
+    assert errmsg == ""
+    assert data["native_conflict_count"] == 0
+    assert data["episode_format"] == (
+        "[VCB-Studio] Getsuyoubi no Tawawa 2 [{ep}][Ma10p_1080p][x265_flac].mkv"
+    )
+
+
+def test_auto_recommend_prefers_bracket_episode_over_title_sequence_native(monkeypatch):
+    helper = EpisodeFormatRuleHelper()
+    samples = [
+        _make_file("[VCB-Studio] Kono Subarashii Sekai ni Shukufuku wo! 3 [01][Ma10p_1080p][x265_flac_aac].mkv"),
+        _make_file("[VCB-Studio] Kono Subarashii Sekai ni Shukufuku wo! 3 [02][Ma10p_1080p][x265_flac_aac].mkv"),
+    ]
+
+    monkeypatch.setattr(
+        "app.helper.format.anitopy.parse",
+        lambda _: {},
+    )
+    monkeypatch.setattr(
+        helper,
+        "_extract_native_episode",
+        lambda item: "3",
+    )
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is True
+    assert errmsg == ""
+    assert data["native_conflict_count"] == 0
+    assert data["episode_format"] == (
+        "[VCB-Studio] Kono Subarashii Sekai ni Shukufuku wo! 3 [{ep}][Ma10p_1080p][x265_flac_aac].mkv"
+    )
+
+
+def test_auto_recommend_corrects_anitopy_title_sequence_bias(monkeypatch):
+    helper = EpisodeFormatRuleHelper()
+    samples = [
+        _make_file(f"[VCB-Studio] Kono Subarashii Sekai ni Shukufuku wo! 3 [{index:02d}][Ma10p_1080p][x265_flac_aac].mkv")
+        for index in range(1, 12)
+    ]
+
+    def _mock_parse(file_name: str):
+        episode_text = file_name.split("[", 2)[2].split("]", 1)[0]
+        if episode_text in {"01", "02"}:
+            return {"episode_number": episode_text}
+        return {"episode_number": "3"}
+
+    monkeypatch.setattr(
+        "app.helper.format.anitopy.parse",
+        _mock_parse,
+    )
+    monkeypatch.setattr(
+        helper,
+        "_extract_native_episode",
+        lambda item: "3",
+    )
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is True
+    assert errmsg == ""
+    assert data["majority_count"] == 11
+    assert data["episode_format"] == (
+        "[VCB-Studio] Kono Subarashii Sekai ni Shukufuku wo! 3 [{ep}][Ma10p_1080p][x265_flac_aac].mkv"
+    )
+
+
+def test_auto_recommend_supports_optional_finale_suffix():
+    helper = EpisodeFormatRuleHelper()
+    sample_names = [
+        "[SHIGURE] Rakudai Kishi no Cavalry - 01 [1080p][AVC_Hi10p_FLAC].mkv",
+        "[SHIGURE] Rakudai Kishi no Cavalry - 02 [1080p][AVC_Hi10p_FLAC].mkv",
+        "[SHIGURE] Rakudai Kishi no Cavalry - 12 Fin [1080p][AVC_Hi10p_FLAC].mkv",
+    ]
+    samples = [_make_file(name) for name in sample_names]
+
+    state, errmsg, data = helper.recommend([], samples)
+
+    assert state is True
+    assert errmsg == ""
+    assert data["episode_format"] == (
+        "[SHIGURE] Rakudai Kishi no Cavalry - {ep} {a}[1080p][AVC_Hi10p_FLAC].mkv"
+    )
+    parser = FormatParser(eformat=data["episode_format"])
+    for sample_name in sample_names:
+        assert parser.match(sample_name) is True
+
+
+def test_should_prefer_fallback_episode_when_anitopy_hits_title_sequence():
+    helper = EpisodeFormatRuleHelper()
+
+    assert helper._should_prefer_fallback_episode(
+        "[VCB-Studio] Kono Subarashii Sekai ni Shukufuku wo! 3 [04][Ma10p_1080p][x265_flac_aac].mkv",
+        "3",
+        "04",
+    ) is True
+    assert helper._should_prefer_fallback_episode(
+        "Show - 04.mkv",
+        "04",
+        "04",
+    ) is False
+
+
+def test_should_prefer_fallback_episode_preserves_anitopy_multi_episode_list():
+    helper = EpisodeFormatRuleHelper()
+
+    assert helper._should_prefer_fallback_episode(
+        "Show 3 [01][02].mkv",
+        ["01", "02"],
+        "02",
+    ) is False
+
+
+def test_extract_episode_with_native_fallback_keeps_anitopy_range_list(monkeypatch):
+    helper = EpisodeFormatRuleHelper()
+    item = _make_file("Show - 01-02 [02].mkv")
+
+    monkeypatch.setattr(
+        "app.helper.format.anitopy.parse",
+        lambda _: {"episode_number": ["01", "02"]},
+    )
+    monkeypatch.setattr(
+        helper,
+        "_extract_native_episode",
+        lambda _: None,
+    )
+
+    normalized_episode, native_episode, used_native_fallback, native_verified = (
+        helper._extract_episode_with_native_fallback(item)
+    )
+
+    assert normalized_episode == "01-02"
+    assert native_episode is None
+    assert used_native_fallback is False
+    assert native_verified is False
+
+
+def test_should_degrade_native_conflict_only_for_preceding_title_number():
+    helper = EpisodeFormatRuleHelper()
+
+    assert helper._should_degrade_native_conflict(
+        "[VCB-Studio] Getsuyoubi no Tawawa 2 [01][Ma10p_1080p][x265_flac].mkv",
+        "01",
+        "2",
+    ) is True
+    assert helper._should_degrade_native_conflict(
+        "Show - 01.mkv",
+        "01",
+        "02",
+    ) is False
+
+
+def test_calculate_variable_span_keeps_optional_base_suffix_span():
+    helper = EpisodeFormatRuleHelper()
+
+    assert helper._calculate_variable_span(" Fin ", [""]) == (0, 5)
 
 
 def test_auto_recommend_marks_native_verified_samples(monkeypatch):
@@ -483,6 +731,101 @@ def test_transfer_chain_recommend_episode_format_passes_helper_data(monkeypatch)
     assert state is True
     assert errmsg == ""
     assert data == helper_data
+
+
+def test_transfer_chain_recommend_episode_format_uses_selected_fileitems(monkeypatch):
+    chain = object.__new__(TransferChain)
+    monkeypatch.setattr(chain, "_media_exts", [".mkv", ".mp4"], raising=False)
+    monkeypatch.setattr(chain, "_subtitle_exts", [".ass", ".ssa"], raising=False)
+    monkeypatch.setattr(chain, "_audio_exts", [".mka", ".aac"], raising=False)
+    selected_fileitems = [
+        FileItem(
+            storage="local",
+            path="/downloads/Show/Show - 01.mkv",
+            type="file",
+            name="Show - 01.mkv",
+            extension="mkv",
+        ),
+        FileItem(
+            storage="local",
+            path="/downloads/Show/Show - 01.ass",
+            type="file",
+            name="Show - 01.ass",
+            extension="ass",
+        ),
+    ]
+    helper_data = {
+        "rule_name": "智能分析",
+        "episode_format": "Show - {ep}.{a}",
+        "sample_file": "Show - 01.mkv",
+        "pattern": None,
+        "sample_count": 2,
+        "majority_count": 2,
+        "confidence": "high",
+        "size_filter_relaxed": False,
+        "native_verified_count": 0,
+        "native_fallback_count": 0,
+        "native_conflict_count": 0,
+        "reason": "selected_samples",
+        "reasons": ["selected_samples"],
+        "message": "已基于选中文件生成集数定位模板",
+    }
+
+    monkeypatch.setattr(
+        chain,
+        "_TransferChain__get_episode_format_rules",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        "app.chain.transfer.EpisodeFormatRuleHelper.recommend",
+        lambda self, rules, sample_files: (True, "", {
+            **helper_data,
+            "received_samples": [item.name for item in sample_files],
+        }),
+    )
+
+    state, errmsg, data = TransferChain.recommend_episode_format(
+        chain,
+        fileitem=None,
+        fileitems=selected_fileitems,
+    )
+
+    assert state is True
+    assert errmsg == ""
+    assert data["received_samples"] == [item.name for item in selected_fileitems]
+
+
+def test_transfer_chain_recommend_episode_format_rejects_invalid_selected_fileitems():
+    chain = object.__new__(TransferChain)
+    chain._media_exts = [".mkv", ".mp4"]
+    chain._subtitle_exts = [".ass", ".ssa"]
+    chain._audio_exts = [".mka", ".aac"]
+    selected_fileitems = [
+        FileItem(
+            storage="local",
+            path="/downloads/Show/Show - 01.mkv",
+            type="file",
+            name="Show - 01.mkv",
+            extension="mkv",
+        ),
+        FileItem(
+            storage="local",
+            path="/downloads/Other/Show - 02.mkv",
+            type="file",
+            name="Show - 02.mkv",
+            extension="mkv",
+        ),
+    ]
+
+    state, errmsg, data = TransferChain.recommend_episode_format(
+        chain,
+        fileitem=None,
+        fileitems=selected_fileitems,
+    )
+
+    assert state is False
+    assert errmsg == "当前选择不满足智能识别条件"
+    assert data is None
 
 
 def test_transfer_chain_episode_format_samples_include_extra_files(monkeypatch):

@@ -1,7 +1,6 @@
 import importlib.util
 import sys
 import types
-import unittest
 from enum import Enum
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -93,9 +92,25 @@ def _load_qbittorrent_modules():
         def from_string(content):
             return types.SimpleNamespace(name="test", total_size=len(content))
 
+    class _DownloaderTorrent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     class TorrentStatus(Enum):
         TRANSFER = "transfer"
         DOWNLOADING = "downloading"
+
+    class TorrentQueryStatus(Enum):
+        ALL = "all"
+        TRANSFER = "transfer"
+        DOWNLOADING = "downloading"
+        COMPLETED = "completed"
+        PAUSED = "paused"
+
+    class DownloadTaskState(Enum):
+        DOWNLOADING = "downloading"
+        PAUSED = "paused"
+        COMPLETED = "completed"
 
     class ModuleType(Enum):
         Downloader = "Downloader"
@@ -110,7 +125,10 @@ def _load_qbittorrent_modules():
     schemas_module.DownloaderInfo = object
     schemas_module.TransferTorrent = object
     schemas_module.DownloadingTorrent = object
+    schemas_module.DownloaderTorrent = _DownloaderTorrent
     schema_types_module.TorrentStatus = TorrentStatus
+    schema_types_module.TorrentQueryStatus = TorrentQueryStatus
+    schema_types_module.DownloadTaskState = DownloadTaskState
     schema_types_module.ModuleType = ModuleType
     schema_types_module.DownloaderType = DownloaderType
     string_module.StringUtils = _StringUtils
@@ -192,161 +210,299 @@ Qbittorrent = qbittorrent_module.Qbittorrent
 QbittorrentModule = qbittorrent_package_module.QbittorrentModule
 
 
-class TestQbittorrentCompat(unittest.TestCase):
-    def test_login_uses_api_key_header_without_auth_login(self):
-        fake_client = MagicMock()
-        fake_client.app_version.return_value = "v5.2.0"
+def test_login_uses_api_key_header_without_auth_login():
+    """API Key 登录时应使用 Bearer Header 并跳过用户名密码登录。"""
+    fake_client = MagicMock()
+    fake_client.app_version.return_value = "v5.2.0"
 
-        with patch.object(qbittorrent_module.qbittorrentapi, "Client", return_value=fake_client) as client_cls:
-            downloader = Qbittorrent(host="http://127.0.0.1", port=8080, apikey="secret-token")
+    with patch.object(qbittorrent_module.qbittorrentapi, "Client", return_value=fake_client) as client_cls:
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, apikey="secret-token")
 
-        self.assertIs(downloader.qbc, fake_client)
-        fake_client.auth_log_in.assert_not_called()
-        fake_client.app_version.assert_called_once_with()
-        self.assertEqual(
-            client_cls.call_args.kwargs["EXTRA_HEADERS"],
-            {"Authorization": "Bearer secret-token"},
+    assert downloader.qbc is fake_client
+    fake_client.auth_log_in.assert_not_called()
+    fake_client.app_version.assert_called_once_with()
+    assert client_cls.call_args.kwargs["EXTRA_HEADERS"] == {"Authorization": "Bearer secret-token"}
+
+
+def test_login_enables_incomplete_file_suffix_by_default():
+    """
+    登录成功后默认开启未完成文件后缀，避免下载中的媒体文件被提前整理。
+    """
+    fake_client = MagicMock()
+    fake_client.app_preferences.return_value = {"incomplete_files_ext": False}
+
+    with patch.object(qbittorrent_module.qbittorrentapi, "Client", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
+
+    assert downloader.qbc is fake_client
+    fake_client.app_set_preferences.assert_called_once_with({"incomplete_files_ext": True})
+
+
+def test_login_disables_incomplete_file_suffix_when_configured():
+    """
+    用户关闭配置后应同步关闭 qBittorrent 未完成文件后缀偏好。
+    """
+    fake_client = MagicMock()
+    fake_client.app_preferences.return_value = {"incomplete_files_ext": True}
+
+    with patch.object(qbittorrent_module.qbittorrentapi, "Client", return_value=fake_client):
+        downloader = Qbittorrent(
+            host="http://127.0.0.1",
+            port=8080,
+            username="admin",
+            password="adminadmin",
+            incomplete_files_ext=False,
         )
 
-    def test_add_torrent_accepts_structured_success_response(self):
-        fake_client = MagicMock()
-        fake_client.torrents_add.return_value = {
-            "success_count": 1,
-            "failure_count": 0,
-            "pending_count": 0,
-            "added_torrent_ids": ["abc123"],
-        }
+    assert downloader.qbc is fake_client
+    fake_client.app_set_preferences.assert_called_once_with({"incomplete_files_ext": False})
 
-        with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
-            downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
 
-        success, added_torrent_ids = downloader.add_torrent(content="https://example.com/test.torrent")
-        self.assertTrue(success)
-        self.assertEqual(added_torrent_ids, ["abc123"])
+def test_login_skips_incomplete_file_suffix_when_already_matches():
+    """
+    远端未完成文件后缀状态已匹配配置时不重复写入全局偏好。
+    """
+    fake_client = MagicMock()
+    fake_client.app_preferences.return_value = {"incomplete_files_ext": True}
 
-    def test_add_torrent_accepts_pending_success_response_without_ids(self):
-        fake_client = MagicMock()
-        fake_client.torrents_add.return_value = {
-            "success_count": 0,
-            "failure_count": 0,
-            "pending_count": 1,
-            "added_torrent_ids": [],
-        }
+    with patch.object(qbittorrent_module.qbittorrentapi, "Client", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
 
-        with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
-            downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
+    assert downloader.qbc is fake_client
+    fake_client.app_set_preferences.assert_not_called()
 
-        success, added_torrent_ids = downloader.add_torrent(content="https://example.com/test.torrent")
-        self.assertTrue(success)
-        self.assertEqual(added_torrent_ids, [])
 
-    def test_add_torrent_uses_cookie_api_for_qbittorrent_52(self):
-        fake_client = MagicMock()
-        fake_client.app_web_api_version.return_value = "2.11.3"
-        fake_client.app_cookies.return_value = [
+def test_completed_status_includes_qbittorrent_finished_upload_states():
+    """
+    qBittorrent 按完成状态查询时应包含非下载中、非暂停的上传侧状态。
+    """
+    server = MagicMock()
+    server.get_torrents.return_value = (
+        [
             {
-                "domain": "old.example.com",
-                "path": "/",
-                "name": "old",
-                "value": "cookie",
+                "name": "QB Done",
+                "content_path": "/downloads/QB Done",
+                "hash": "hash-qb",
+                "total_size": 1024,
+                "completed": 1024,
+                "progress": 1,
+                "state": "stalledUP",
+                "tags": "moviepilot-tag",
+                "dlspeed": 0,
+                "upspeed": 128,
+            },
+            {
+                "name": "QB Downloading",
+                "content_path": "/downloads/QB Downloading",
+                "hash": "hash-downloading",
+                "total_size": 2048,
+                "completed": 1024,
+                "progress": 0.5,
+                "state": "queuedDL",
+                "tags": "moviepilot-tag",
+                "dlspeed": 64,
+                "upspeed": 0,
+            },
+        ],
+        False,
+    )
+    module = QbittorrentModule.__new__(QbittorrentModule)
+    module.get_instances = MagicMock(return_value={"qb": server})
+    module.normalize_return_path = MagicMock(side_effect=lambda path, _name: str(path))
+
+    torrents = module.list_torrents(status="completed")
+
+    assert [torrent.hash for torrent in torrents] == ["hash-qb"]
+    assert torrents[0].state == "completed"
+    server.get_torrents.assert_called_once_with(tags="moviepilot-tag")
+
+
+def test_list_torrents_include_all_tags_removes_builtin_tag_filter():
+    """
+    智能体扩大查询范围时，qBittorrent 查询应取消内置标签过滤。
+    """
+    server = MagicMock()
+    server.get_torrents.return_value = (
+        [
+            {
+                "name": "External Task",
+                "content_path": "/downloads/External Task",
+                "hash": "hash-external",
+                "total_size": 1024,
+                "completed": 1024,
+                "progress": 1,
+                "state": "stalledUP",
+                "tags": "external",
+                "dlspeed": 0,
+                "upspeed": 0,
             }
-        ]
-        fake_client.torrents_add.return_value = "Ok."
+        ],
+        False,
+    )
+    module = QbittorrentModule.__new__(QbittorrentModule)
+    module.get_instances = MagicMock(return_value={"qb": server})
+    module.normalize_return_path = MagicMock(side_effect=lambda path, _name: str(path))
 
-        with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
-            downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
+    torrents = module.list_torrents(include_all_tags=True)
 
-        success, added_torrent_ids = downloader.add_torrent(
-            content="https://tracker.example.com/download?id=1",
-            cookie="uid=1; passkey=abc",
-        )
-        self.assertTrue(success)
-        self.assertEqual(added_torrent_ids, [])
-        set_cookie_call = fake_client.app_set_cookies.call_args.kwargs["cookies"]
-        self.assertIn(
-            {
-                "domain": "tracker.example.com",
-                "path": "/",
-                "name": "uid",
-                "value": "1",
-            },
-            set_cookie_call,
-        )
-        self.assertIn(
-            {
-                "domain": "tracker.example.com",
-                "path": "/",
-                "name": "passkey",
-                "value": "abc",
-            },
-            set_cookie_call,
-        )
-        self.assertIsNone(fake_client.torrents_add.call_args.kwargs["cookie"])
-
-    def test_add_torrent_keeps_legacy_cookie_param_for_old_webapi(self):
-        fake_client = MagicMock()
-        fake_client.app_web_api_version.return_value = "2.11.2"
-        fake_client.torrents_add.return_value = "Ok."
-
-        with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
-            downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
-
-        success, added_torrent_ids = downloader.add_torrent(
-            content="https://tracker.example.com/download?id=1",
-            cookie="uid=1",
-        )
-        self.assertTrue(success)
-        self.assertEqual(added_torrent_ids, [])
-        fake_client.app_set_cookies.assert_not_called()
-        self.assertEqual(fake_client.torrents_add.call_args.kwargs["cookie"], "uid=1")
+    assert [torrent.hash for torrent in torrents] == ["hash-external"]
+    server.get_torrents.assert_called_once_with(tags=None)
 
 
-class TestQbittorrentModuleCompat(unittest.TestCase):
-    @staticmethod
-    def _build_module(server):
-        module = QbittorrentModule.__new__(QbittorrentModule)
-        module.get_instance = MagicMock(return_value=server)
-        module.normalize_path = MagicMock(side_effect=lambda path, _downloader: path)
-        module.get_default_config_name = MagicMock(return_value="default-qb")
-        return module
+def test_add_torrent_accepts_structured_success_response():
+    """新版 qBittorrent API 结构化成功响应应返回新增种子 ID。"""
+    fake_client = MagicMock()
+    fake_client.torrents_add.return_value = {
+        "success_count": 1,
+        "failure_count": 0,
+        "pending_count": 0,
+        "added_torrent_ids": ["abc123"],
+    }
 
-    def test_download_prefers_added_torrent_ids_before_tag_lookup(self):
-        fake_server = MagicMock()
-        fake_server.add_torrent.return_value = (True, ["abc123"])
-        fake_server.get_content_layout.return_value = "Original"
-        fake_server.is_force_resume.return_value = False
+    with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
 
-        module = self._build_module(fake_server)
-        result = module.download(
-            content="magnet:?xt=urn:btih:123",
-            download_dir=Path("/downloads"),
-            cookie="",
-            downloader="qb",
-        )
+    success, added_torrent_ids = downloader.add_torrent(content="https://example.com/test.torrent")
+    assert success
+    assert added_torrent_ids == ["abc123"]
 
-        self.assertEqual(result, ("qb", "abc123", "Original", "添加下载成功"))
-        fake_server.delete_torrents_tag.assert_called_once_with("abc123", "tmp-tag-01")
-        fake_server.get_torrent_id_by_tag.assert_not_called()
-        self.assertEqual(
-            fake_server.add_torrent.call_args.kwargs["tag"],
-            ["tmp-tag-01", "moviepilot-tag"],
-        )
 
-    def test_download_falls_back_to_tag_lookup_when_added_ids_missing(self):
-        fake_server = MagicMock()
-        fake_server.add_torrent.return_value = (True, [])
-        fake_server.get_content_layout.return_value = "Original"
-        fake_server.get_torrent_id_by_tag.return_value = "def456"
-        fake_server.is_force_resume.return_value = False
+def test_add_torrent_accepts_pending_success_response_without_ids():
+    """新版 qBittorrent API 待处理成功响应没有 ID 时仍应视为添加成功。"""
+    fake_client = MagicMock()
+    fake_client.torrents_add.return_value = {
+        "success_count": 0,
+        "failure_count": 0,
+        "pending_count": 1,
+        "added_torrent_ids": [],
+    }
 
-        module = self._build_module(fake_server)
-        result = module.download(
-            content="magnet:?xt=urn:btih:456",
-            download_dir=Path("/downloads"),
-            cookie="",
-            downloader="qb",
-        )
+    with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
 
-        self.assertEqual(result, ("qb", "def456", "Original", "添加下载成功"))
-        fake_server.delete_torrents_tag.assert_not_called()
-        fake_server.get_torrent_id_by_tag.assert_called_once_with(tags="tmp-tag-01")
+    success, added_torrent_ids = downloader.add_torrent(content="https://example.com/test.torrent")
+    assert success
+    assert added_torrent_ids == []
+
+
+def test_add_torrent_uses_cookie_api_for_qbittorrent_52():
+    """qBittorrent 5.2 对应 Web API 应通过 Cookie API 同步站点 Cookie。"""
+    fake_client = MagicMock()
+    fake_client.app_web_api_version.return_value = "2.11.3"
+    fake_client.app_cookies.return_value = [
+        {
+            "domain": "old.example.com",
+            "path": "/",
+            "name": "old",
+            "value": "cookie",
+        }
+    ]
+    fake_client.torrents_add.return_value = "Ok."
+
+    with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
+
+    success, added_torrent_ids = downloader.add_torrent(
+        content="https://tracker.example.com/download?id=1",
+        cookie="uid=1; passkey=abc",
+    )
+    assert success
+    assert added_torrent_ids == []
+    set_cookie_call = fake_client.app_set_cookies.call_args.kwargs["cookies"]
+    assert {
+        "domain": "tracker.example.com",
+        "path": "/",
+        "name": "uid",
+        "value": "1",
+    } in set_cookie_call
+    assert {
+        "domain": "tracker.example.com",
+        "path": "/",
+        "name": "passkey",
+        "value": "abc",
+    } in set_cookie_call
+    assert fake_client.torrents_add.call_args.kwargs["cookie"] is None
+
+
+def test_add_torrent_keeps_legacy_cookie_param_for_old_webapi():
+    """旧版 qBittorrent Web API 不支持 Cookie API 时保留添加种子 Cookie 参数。"""
+    fake_client = MagicMock()
+    fake_client.app_web_api_version.return_value = "2.11.2"
+    fake_client.torrents_add.return_value = "Ok."
+
+    with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
+
+    success, added_torrent_ids = downloader.add_torrent(
+        content="https://tracker.example.com/download?id=1",
+        cookie="uid=1",
+    )
+    assert success
+    assert added_torrent_ids == []
+    fake_client.app_set_cookies.assert_not_called()
+    assert fake_client.torrents_add.call_args.kwargs["cookie"] == "uid=1"
+
+
+def _build_module(server):
+    """构造仅包含下载所需方法的 QbittorrentModule 测试实例。"""
+    module = QbittorrentModule.__new__(QbittorrentModule)
+    module.get_instance = MagicMock(return_value=server)
+    module.normalize_path = MagicMock(side_effect=lambda path, _downloader: path)
+    module.get_default_config_name = MagicMock(return_value="default-qb")
+    return module
+
+
+def test_download_prefers_added_torrent_ids_before_tag_lookup():
+    """添加任务响应包含种子 ID 时应优先使用响应值。"""
+    fake_server = MagicMock()
+    fake_server.add_torrent.return_value = (True, ["abc123"])
+    fake_server.get_content_layout.return_value = "Original"
+    fake_server.is_force_resume.return_value = False
+
+    module = _build_module(fake_server)
+    result = module.download(
+        content="magnet:?xt=urn:btih:123",
+        download_dir=Path("/downloads"),
+        cookie="",
+        downloader="qb",
+    )
+
+    assert result == ("qb", "abc123", "Original", "添加下载成功")
+    fake_server.delete_torrents_tag.assert_called_once_with("abc123", "tmp-tag-01")
+    fake_server.get_torrent_id_by_tag.assert_not_called()
+    assert fake_server.add_torrent.call_args.kwargs["tag"] == ["tmp-tag-01", "moviepilot-tag"]
+
+
+def test_download_falls_back_to_tag_lookup_when_added_ids_missing():
+    """添加任务响应缺少种子 ID 时应回退到临时标签查询。"""
+    fake_server = MagicMock()
+    fake_server.add_torrent.return_value = (True, [])
+    fake_server.get_content_layout.return_value = "Original"
+    fake_server.get_torrent_id_by_tag.return_value = "def456"
+    fake_server.is_force_resume.return_value = False
+
+    module = _build_module(fake_server)
+    result = module.download(
+        content="magnet:?xt=urn:btih:456",
+        download_dir=Path("/downloads"),
+        cookie="",
+        downloader="qb",
+    )
+
+    assert result == ("qb", "def456", "Original", "添加下载成功")
+    fake_server.delete_torrents_tag.assert_not_called()
+    fake_server.get_torrent_id_by_tag.assert_called_once_with(tags="tmp-tag-01")
+
+
+def test_set_speed_limit_allows_single_direction_limit():
+    """
+    设置全局限速时允许只传一个方向，未传方向按不限速处理。
+    """
+    fake_client = MagicMock()
+
+    with patch.object(Qbittorrent, "_Qbittorrent__login_qbittorrent", return_value=fake_client):
+        downloader = Qbittorrent(host="http://127.0.0.1", port=8080, username="admin", password="adminadmin")
+
+    assert downloader.set_speed_limit(download_limit=1024)
+    assert fake_client.transfer.download_limit == 1024 * 1024
+    assert fake_client.transfer.upload_limit == 0

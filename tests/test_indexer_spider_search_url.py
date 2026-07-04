@@ -1,4 +1,5 @@
 from urllib.parse import parse_qs, urlparse
+from unittest.mock import patch
 
 from app.modules.indexer.spider import SiteSpider
 from app.modules.indexer.spider.haidan import HaiDanSpider
@@ -174,3 +175,204 @@ def test_haidan_empty_keyword_uses_blank_search_value():
 
     assert params["search"] == ""
     assert params["search_area"] == "0"
+
+
+def test_python_spider_remove_does_not_pollute_other_fields():
+    """
+    Python fallback 解析带 remove 的字段时不能影响同一行后续字段选择。
+    """
+    indexer = _build_indexer(
+        torrents={
+            "list": {"selector": "table.torrents > tr"},
+            "fields": {
+                "title": {"selector": "a.title"},
+                "description": {
+                    "selector": "td.desc",
+                    "remove": "span.noise",
+                },
+                "imdbid": {"selector": "span.noise"},
+            },
+        },
+    )
+    html = """
+    <table class="torrents">
+      <tr>
+        <td><a class="title">Movie.Title</a></td>
+        <td class="desc">Main description <span class="noise">tt1234567</span></td>
+      </tr>
+    </table>
+    """
+
+    with patch("app.modules.indexer.spider.rust_accel.parse_indexer_torrents", return_value=None):
+        result = SiteSpider(indexer).parse(html)
+
+    assert result == [{
+        "title": "Movie.Title",
+        "description": "Main description",
+        "imdbid": "tt1234567",
+    }]
+
+
+def test_python_spider_parses_nexus_php_occurrence_time_cell():
+    """
+    Python 兜底解析应兼容 NexusPHP 发生时间模式下没有 span 的时间单元格。
+    """
+    indexer = _build_indexer(
+        torrents={
+            "list": {"selector": 'table.torrents > tr:has("table.torrentname")'},
+            "fields": {
+                "title": {"selector": 'a[href*="details.php?id="]'},
+                "date_elapsed": {"selector": "td:nth-child(4) > span", "optional": True},
+                "date_added": {
+                    "selector": "td:nth-child(4) > span",
+                    "attribute": "title",
+                    "optional": True,
+                },
+                "date": {
+                    "text": "{% if fields['date_elapsed'] or fields['date_added'] %}"
+                            "{{ fields['date_elapsed'] if fields['date_elapsed'] else fields['date_added'] }}"
+                            "{% else %}now{% endif %}",
+                    "filters": [{"name": "dateparse", "args": "%Y-%m-%d %H:%M:%S"}],
+                },
+            },
+        },
+    )
+    html = """
+    <table class="torrents">
+      <tr>
+        <td></td>
+        <td><table class="torrentname"><tr><td><a href="details.php?id=1">Movie.Title</a></td></tr></table></td>
+        <td></td>
+        <td class="rowfollow nowrap">2025-05-01<br/>12:13:14</td>
+      </tr>
+    </table>
+    """
+
+    with patch("app.modules.indexer.spider.rust_accel.parse_indexer_torrents", return_value=None):
+        result = SiteSpider(indexer).parse(html)
+
+    assert result[0]["pubdate"] == "2025-05-01 12:13:14"
+
+
+def test_python_spider_does_not_use_relative_date_as_pubdate():
+    """
+    Python 兜底解析不能把相对时间写入 pubdate。
+    """
+    indexer = _build_indexer(
+        torrents={
+            "list": {"selector": "table.torrents > tr"},
+            "fields": {
+                "title": {"selector": "a.title"},
+                "date_elapsed": {"selector": "span.elapsed"},
+                "date": {
+                    "text": "{% if fields['date_elapsed'] or fields['date_added'] %}"
+                            "{{ fields['date_elapsed'] if fields['date_elapsed'] else fields['date_added'] }}"
+                            "{% else %}now{% endif %}",
+                    "filters": [{"name": "dateparse", "args": "%Y-%m-%d %H:%M:%S"}],
+                },
+            },
+        },
+    )
+    html = """
+    <table class="torrents">
+      <tr><td><a class="title">Movie.Title</a><span class="elapsed">1小时</span></td></tr>
+    </table>
+    """
+
+    with patch("app.modules.indexer.spider.rust_accel.parse_indexer_torrents", return_value=None):
+        result = SiteSpider(indexer).parse(html)
+
+    assert "pubdate" not in result[0] or result[0]["pubdate"] is None
+
+
+def test_python_spider_does_not_use_invalid_date_as_pubdate():
+    """
+    Python 兜底解析不能把列错位的无效日期写入 pubdate。
+    """
+    indexer = _build_indexer(
+        torrents={
+            "list": {"selector": "table.torrents > tr"},
+            "fields": {
+                "title": {"selector": "a.title"},
+                "date_added": {"selector": "td:nth-child(4) > span", "attribute": "title"},
+                "date_elapsed": {"selector": "td:nth-child(4) > span"},
+                "date": {
+                    "text": "{% if fields['date_elapsed'] or fields['date_added'] %}"
+                            "{{ fields['date_elapsed'] if fields['date_elapsed'] else fields['date_added'] }}"
+                            "{% else %}now{% endif %}",
+                    "filters": [{"name": "dateparse", "args": "%Y-%m-%d %H:%M:%S"}],
+                },
+            },
+        },
+    )
+    html = """
+    <table class="torrents">
+      <tr>
+        <td><a class="title">Movie.Title</a></td>
+        <td></td>
+        <td></td>
+        <td>0</td>
+      </tr>
+    </table>
+    """
+
+    with patch("app.modules.indexer.spider.rust_accel.parse_indexer_torrents", return_value=None):
+        result = SiteSpider(indexer).parse(html)
+
+    assert "pubdate" not in result[0] or result[0]["pubdate"] is None
+
+
+def test_nexus_php_subtitle_table_parse_extracts_common_fields():
+    """
+    NexusPHP 字幕表格应解析出下载链接、语言、标题、时间、大小、点击、上传者等字段。
+    """
+    indexer = _build_indexer(
+        subtitles={
+            "search": {
+                "paths": [{"path": "subtitles.php?search={keyword}&lang_id=0"}],
+            },
+            "list": {"selector": "table tr:has(td.rowfollow)"},
+            "fields": {
+                "language": {"selector": "td:nth-child(1) img", "attribute": "title"},
+                "language_icon": {"selector": "td:nth-child(1) img", "attribute": "src"},
+                "title": {"selector": "td:nth-child(2) a"},
+                "download": {"selector": "td:nth-child(2) a", "attribute": "href"},
+                "date_added": {"selector": "td:nth-child(3) span", "attribute": "title"},
+                "date_elapsed": {"selector": "td:nth-child(3) span"},
+                "size": {"selector": "td:nth-child(4)"},
+                "grabs": {"selector": "td:nth-child(5)"},
+                "uploader": {"selector": "td:nth-child(6)"},
+                "report": {"selector": "td:nth-child(7) a", "attribute": "href"},
+            },
+        },
+    )
+    html = """
+    <table width="940" border="1" cellspacing="0" cellpadding="5">
+    <tbody><tr><td class="colhead">语言</td><td width="100%" class="colhead" align="center">标题</td></tr>
+    <tr><td class="rowfollow" align="center" valign="middle"><img border="0" src="pic/flag/japan.gif" alt="日本語" title="日本語"></td>
+    <td class="rowfollow" align="left"><a href="downloadsubs.php?torrentid=514068&amp;subid=2179">739437-second-to-last-love-s03-2025-1080p-fod-web-dl-aac20-h264-magicstar-japanese-subtitle</a></td>
+    <td class="rowfollow" align="center"><nobr><span title="2026-03-17 19:48:55">2月23天</span></nobr></td>
+    <td class="rowfollow" align="center">233.19&nbsp;KB</td>
+    <td class="rowfollow" align="center">0</td>
+    <td class="rowfollow" align="center"><i>匿名</i></td>
+    <td class="rowfollow" align="center"><a href="report.php?subtitle=2179"><img class="f_report" src="pic/trans.gif" alt="Report" title="举报该字幕"></a></td>
+    </tr>
+    </tbody></table>
+    """
+
+    result = SiteSpider(indexer, keyword="love", search_type="subtitles").parse(html)
+
+    assert result == [{
+        "title": "739437-second-to-last-love-s03-2025-1080p-fod-web-dl-aac20-h264-magicstar-japanese-subtitle",
+        "enclosure": "https://example.com/downloadsubs.php?torrentid=514068&subid=2179",
+        "size": 238787,
+        "pubdate": "2026-03-17 19:48:55",
+        "date_elapsed": "2月23天",
+        "grabs": 0,
+        "language_icon": "https://example.com/pic/flag/japan.gif",
+        "report_url": "https://example.com/report.php?subtitle=2179",
+        "language": "日本語",
+        "uploader": "匿名",
+        "torrent_id": "514068",
+        "subtitle_id": "2179",
+    }]

@@ -25,6 +25,7 @@ from app.core.config import settings
 from app.core.event import eventmanager
 from app.db.plugindata_oper import PluginDataOper
 from app.db.systemconfig_oper import SystemConfigOper
+from app.helper.server import MoviePilotServerHelper
 from app.helper.plugin import PluginHelper
 from app.helper.sites import SitesHelper  # noqa
 from app.log import logger
@@ -54,6 +55,9 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         self._stop_monitor_event = threading.Event()
         # 本地插件同步写入运行目录后的短时忽略窗口
         self._recent_local_sync: Dict[str, float] = {}
+        # 插件智能体工具注册表缓存，插件启停或配置生效时主动失效。
+        self._plugin_agent_tools_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._plugin_agent_tools_cache_lock = threading.Lock()
         # 开发者模式监测插件修改
         if settings.DEV or settings.PLUGIN_AUTO_RELOAD:
             self.__start_monitor()
@@ -111,6 +115,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     eventmanager.disable_event_handler(plugin)
             except Exception as err:
                 logger.error(f"加载插件 {plugin_id} 出错：{str(err)} - {traceback.format_exc()}")
+        self.clear_plugin_agent_tools_cache()
 
     def init_plugin(self, plugin_id: str, conf: dict):
         """
@@ -130,6 +135,14 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         else:
             # 禁用插件类的事件处理器
             eventmanager.disable_event_handler(type(plugin))
+        self.clear_plugin_agent_tools_cache()
+
+    def clear_plugin_agent_tools_cache(self) -> None:
+        """
+        清空插件智能体工具注册表缓存。
+        """
+        with self._plugin_agent_tools_cache_lock:
+            self._plugin_agent_tools_cache.clear()
 
     def stop(self, pid: Optional[str] = None):
         """
@@ -166,6 +179,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             self._running_plugins = {}
             # 清除所有插件模块缓存
             self._clear_plugin_modules()
+        self.clear_plugin_agent_tools_cache()
         logger.info("插件停止完成")
 
     @staticmethod
@@ -359,7 +373,6 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                 if runtime_pid:
                     last_sync_time = self._recent_local_sync.get(runtime_pid)
                     if last_sync_time and time.time() - last_sync_time < 2:
-                        logger.debug(f"忽略本地插件同步产生的运行目录变化：{runtime_pid}")
                         continue
                     # 运行目录变化只重载，不能反向触发本地同步。
                     plugins_to_reload.add(runtime_pid)
@@ -415,7 +428,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                 return None
 
             # 读取 __init__.py 文件，查找插件主类名
-            with open(init_file, "r", encoding="utf-8") as f:
+            with open(init_file, "r", encoding="utf-8", errors="replace") as f:
                 source_code = f.read()
 
             tree = ast.parse(source_code)
@@ -466,7 +479,8 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     pid=plugin_dir_name,
                     package_version=package_version,
                     repo_path=local_repo_path,
-                    strict_compat=False
+                    strict_compat=False,
+                    strict_system_version=not settings.DEV
                 )
                 if candidate:
                     return candidate
@@ -487,6 +501,9 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
 
         candidate = candidate or PluginHelper().get_local_plugin_candidate(pid)
         if not candidate:
+            return False
+        if candidate.get("compatible") is False:
+            logger.info(f"本地插件 {pid} 不满足同步条件，跳过自动同步：{candidate.get('skip_reason')}")
             return False
 
         source_dir = Path(candidate.get("path"))
@@ -591,6 +608,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             state, msg = PluginHelper().install(pid=plugin.id, repo_url=plugin.repo_url, force_install=True)
             elapsed_time = time.time() - start_time
             if state:
+                MoviePilotServerHelper.install_plugin_reg(plugin_id=plugin.id, repo_url=plugin.repo_url)
                 logger.info(
                     f"插件 {plugin.plugin_name} 安装成功，版本：{plugin.plugin_version}，耗时：{elapsed_time:.2f} 秒")
                 sync_plugins.append(plugin.id)
@@ -705,21 +723,23 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         await SystemConfigOper().async_set(self._config_key % pid, conf)
         return True
 
-    def delete_plugin_config(self, pid: str) -> bool:
+    def delete_plugin_config(self, pid: str, force: bool = False) -> bool:
         """
         删除插件配置
         :param pid: 插件ID
+        :param force: 插件停止后仍允许按插件 ID 删除持久化配置
         """
-        if not self._plugins.get(pid):
+        if not force and not self._plugins.get(pid):
             return False
         return SystemConfigOper().delete(self._config_key % pid)
 
-    def delete_plugin_data(self, pid: str) -> bool:
+    def delete_plugin_data(self, pid: str, force: bool = False) -> bool:
         """
         删除插件数据
         :param pid: 插件ID
+        :param force: 插件停止后仍允许按插件 ID 删除持久化数据
         """
-        if not self._plugins.get(pid):
+        if not force and not self._plugins.get(pid):
             return False
         PluginDataOper().del_data(pid)
         return True
@@ -877,6 +897,21 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     logger.error(f"获取插件 {plugin_id} 动作出错：{str(e)}")
         return ret_actions
 
+    @staticmethod
+    def _copy_plugin_agent_tools(
+        tools_info: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        复制插件智能体工具注册信息，避免调用方修改缓存内容。
+        """
+        return [
+            {
+                **plugin_info,
+                "tools": list(plugin_info.get("tools", [])),
+            }
+            for plugin_info in tools_info
+        ]
+
     def get_plugin_agent_tools(self, pid: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         获取插件智能体工具
@@ -886,6 +921,12 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             "tools": [ToolClass1, ToolClass2, ...]
         }]
         """
+        cache_key = pid or "__all__"
+        with self._plugin_agent_tools_cache_lock:
+            cached_tools = self._plugin_agent_tools_cache.get(cache_key)
+        if cached_tools is not None:
+            return self._copy_plugin_agent_tools(cached_tools)
+
         ret_tools = []
         # 创建字典快照避免并发修改
         running_plugins_snapshot = dict(self._running_plugins)
@@ -905,6 +946,10 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                         })
                 except Exception as e:
                     logger.error(f"获取插件 {plugin_id} 智能体工具出错：{str(e)}")
+        with self._plugin_agent_tools_cache_lock:
+            self._plugin_agent_tools_cache[cache_key] = self._copy_plugin_agent_tools(
+                ret_tools
+            )
         return ret_tools
 
     @staticmethod
@@ -947,6 +992,47 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     "name": plugin.plugin_name,
                 })
         return remotes
+
+    def get_plugin_auth_providers(self) -> List[Dict[str, Any]]:
+        """
+        聚合插件声明的登录认证提供方。
+
+        :return: 插件认证入口列表
+        """
+        providers: List[Dict[str, Any]] = []
+        running_plugins_snapshot = dict(self._running_plugins)
+        for plugin_id, plugin in running_plugins_snapshot.items():
+            if not plugin.get_state():
+                continue
+            if not hasattr(plugin, "get_auth_providers") or not ObjectUtils.check_method(plugin.get_auth_providers):
+                continue
+            try:
+                plugin_providers = plugin.get_auth_providers() or []
+            except Exception as e:
+                logger.error(f"获取插件 {plugin_id} 登录认证提供方出错：{str(e)}")
+                continue
+            render_mode = None
+            dist_path = None
+            if hasattr(plugin, "get_render_mode"):
+                render_mode, dist_path = plugin.get_render_mode()
+            for raw_provider in plugin_providers:
+                if not raw_provider or not isinstance(raw_provider, dict):
+                    continue
+                provider = raw_provider.copy()
+                provider["type"] = "plugin"
+                provider["plugin_id"] = plugin_id
+                provider.setdefault("id", f"plugin:{plugin_id}")
+                provider.setdefault("name", plugin.plugin_name)
+                provider.setdefault("enabled", True)
+                if render_mode == "vue" and dist_path:
+                    provider.setdefault("component", "AuthPage")
+                    provider["remote"] = {
+                        "id": plugin_id,
+                        "url": self.get_plugin_remote_entry(plugin_id, dist_path),
+                        "name": plugin.plugin_name,
+                    }
+                providers.append(provider)
+        return providers
 
     def get_plugin_sidebar_nav(self) -> List[Dict[str, Any]]:
         """
@@ -1038,7 +1124,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                 logger.error(f"获取插件[{plugin_id}]仪表盘元数据出错：{str(e)}")
         return dashboard_meta
 
-    def get_plugin_dashboard(self, pid: str, key: str, user_agent: str = None) -> schemas.PluginDashboard:
+    def get_plugin_dashboard(self, pid: str, key: str, user_agent: str = None) -> Optional[schemas.PluginDashboard]:
         """
         获取插件仪表盘
         """
@@ -1071,6 +1157,12 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             logger.error(f"插件 {pid} 调用方法 get_dashboard 出错: {str(e)}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail=f"插件 {pid} 调用方法 get_dashboard 出错: {str(e)}")
+        if dashboard is None:
+            return None
+        if not isinstance(dashboard, (tuple, list)) or len(dashboard) != 3:
+            logger.error(f"插件 {pid} 返回的仪表盘数据格式错误")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"插件 {pid} 返回的仪表盘数据格式错误")
         cols, attrs, elements = dashboard
         return schemas.PluginDashboard(
             id=pid,
@@ -1256,6 +1348,20 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         # 根据加载排序重新排序
         plugins.sort(key=lambda x: x.plugin_order if hasattr(x, "plugin_order") else 0)
         return plugins
+
+    def get_local_plugin_version(self, pid: str) -> Optional[str]:
+        """
+        获取指定已安装插件的本地版本，不触发全部插件的状态、页面和权限计算。
+
+        插件类由运行期动态加载，旧插件可能未声明版本属性，因此缺失时返回 None。
+        """
+        installed_apps = SystemConfigOper().get(SystemConfigKey.UserInstalledPlugins) or []
+        if pid not in installed_apps:
+            return None
+        plugin_class = self._plugins.get(pid)
+        if not plugin_class:
+            return None
+        return getattr(plugin_class, "plugin_version", None)
 
     def get_local_repo_plugins(self) -> List[schemas.Plugin]:
         """
@@ -1486,14 +1592,15 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         if plugin_info.get("icon"):
             plugin.plugin_icon = plugin_info.get("icon")
         # 标签
-        if plugin_info.get("labels"):
-            plugin.plugin_label = plugin_info.get("labels")
+        plugin.plugin_label = self._normalize_plugin_label(plugin_info.get("labels"))
         # 作者
         if plugin_info.get("author"):
             plugin.plugin_author = plugin_info.get("author")
         # 更新历史
         if plugin_info.get("history"):
             plugin.history = plugin_info.get("history")
+        # Release 能力位来自插件市场索引，用于前端展示和后端安装入口双重校验。
+        plugin.release = bool(plugin_info.get("release"))
         # 仓库链接
         plugin.repo_url = market
         # 本地标志
@@ -1503,60 +1610,115 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
 
         return plugin
 
-    async def async_get_online_plugins(self, force: bool = False) -> List[schemas.Plugin]:
+    @staticmethod
+    def _normalize_plugin_label(labels: Any) -> Optional[str]:
+        """
+        规整插件市场标签字段，兼容旧字符串和新列表格式。
+
+        :param labels: 插件市场 package 中的 labels 字段
+        :return: 用空格拼接后的标签字符串，无法识别或为空时返回 None
+        """
+        if isinstance(labels, str):
+            label = labels.strip()
+            return label or None
+        if isinstance(labels, list):
+            normalized_labels = [str(item).strip() for item in labels if str(item).strip()]
+            return " ".join(normalized_labels) or None
+        return None
+
+    async def async_get_online_plugins(
+            self,
+            force: bool = False,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> List[schemas.Plugin]:
         """
         异步获取所有在线插件信息
         :param force: 是否强制刷新（忽略缓存）
+        :param progress_callback: 定时服务进度更新回调
         """
         if not settings.PLUGIN_MARKET:
+            if progress_callback:
+                progress_callback(value=100, text="未配置插件市场，跳过刷新")
             return []
 
-        # 用于存储高于 v1 版本的插件（如 v2, v3 等）
+        async def fetch_market(
+                market: str,
+                package_version: Optional[str],
+                result_version: str,
+                task_index: int,
+        ) -> Tuple[int, str, List[schemas.Plugin]]:
+            """
+            获取单个市场版本的插件列表并保留结果分组。
+            """
+            plugins = await self.async_get_plugins_from_market(
+                market,
+                package_version,
+                force,
+            )
+            return task_index, result_version, plugins or []
+
         higher_version_plugins = []
-        # 用于存储 v1 版本插件
         base_version_plugins = []
-
-        # 使用异步并发获取线上插件
-        import asyncio
         tasks = []
-        task_to_version = {}
 
-        for m in settings.PLUGIN_MARKET.split(","):
-            if not m:
+        for market in settings.PLUGIN_MARKET.split(","):
+            if not market:
                 continue
-            # 创建任务获取 v1 版本插件
-            base_task = asyncio.create_task(self.async_get_plugins_from_market(m, None, force))
-            tasks.append(base_task)
-            task_to_version[base_task] = "base_version"
-
-            # 创建任务获取高版本插件（如 v2、v3）
+            tasks.append(
+                asyncio.create_task(
+                    fetch_market(market, None, "base_version", len(tasks))
+                )
+            )
             if settings.VERSION_FLAG:
-                higher_version_task = asyncio.create_task(
-                    self.async_get_plugins_from_market(m, settings.VERSION_FLAG, force))
-                tasks.append(higher_version_task)
-                task_to_version[higher_version_task] = "higher_version"
+                tasks.append(
+                    asyncio.create_task(
+                        fetch_market(
+                            market,
+                            settings.VERSION_FLAG,
+                            "higher_version",
+                            len(tasks),
+                        )
+                    )
+                )
 
-        # 并发执行所有任务
         if tasks:
-            completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, result in enumerate(completed_tasks):
-                task = tasks[i]
-                version = task_to_version[task]
-
-                # 检查是否有异常
-                if isinstance(result, Exception):
-                    logger.error(f"获取插件市场数据失败：{str(result)}")
-                    continue
-
-                plugins = result
+            total_tasks = len(tasks)
+            finished_tasks = 0
+            task_results = {}
+            if progress_callback:
+                progress_callback(
+                    value=0,
+                    text=f"开始刷新插件市场，共 {total_tasks} 个请求 ...",
+                    data={"total": total_tasks, "finished": 0},
+                )
+            for completed_task in asyncio.as_completed(tasks):
+                try:
+                    task_index, version, plugins = await completed_task
+                    task_results[task_index] = (version, plugins)
+                except Exception as err:
+                    logger.error(f"获取插件市场数据失败：{str(err)}")
+                finished_tasks += 1
+                if progress_callback:
+                    progress_callback(
+                        value=finished_tasks / total_tasks * 100,
+                        text=(
+                            f"插件市场请求"
+                            f"（{finished_tasks}/{total_tasks}）处理完成"
+                        ),
+                        data={"total": total_tasks, "finished": finished_tasks},
+                    )
+            for task_index in sorted(task_results):
+                version, plugins = task_results[task_index]
                 if plugins:
                     if version == "higher_version":
-                        higher_version_plugins.extend(plugins)  # 收集高版本插件
+                        higher_version_plugins.extend(plugins)
                     else:
-                        base_version_plugins.extend(plugins)  # 收集 v1 版本插件
+                        base_version_plugins.extend(plugins)
 
         result = self.process_plugins_list(higher_version_plugins, base_version_plugins)
         logger.info(f"获取到 {len(result)} 个线上插件")
+        if progress_callback:
+            progress_callback(value=100, text="插件市场缓存刷新完成")
         return result
 
     async def async_get_plugins_from_market(self, market: str,
@@ -1807,7 +1969,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         修改Python文件中的类名和插件信息
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
 
             # 替换类名
@@ -1896,7 +2058,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                 # 处理JS文件
                 if file_path.suffix == '.js':
                     try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
+                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                             content = f.read()
 
                         # 替换类名引用（精确匹配）
@@ -1921,7 +2083,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                 # 处理CSS文件
                 elif file_path.suffix == '.css':
                     try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
+                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                             content = f.read()
 
                         # 替换CSS中可能的类名引用

@@ -148,7 +148,9 @@ def create_access_token(
     return encoded_jwt
 
 
-def __set_or_refresh_resource_token_cookie(request: Request, response: Response, payload: schemas.TokenPayload):
+def set_or_refresh_resource_token_cookie(
+        request: Request, response: Response, payload: schemas.TokenPayload
+) -> None:
     """
     设置资源令牌 Cookie
     :param request: 包含请求相关的上下文数据
@@ -186,12 +188,19 @@ def __set_or_refresh_resource_token_cookie(request: Request, response: Response,
         purpose="resource"
     )
 
+    # 判断请求是否为 HTTPS：直连协议为 https，或经反向代理转发时携带 X-Forwarded-Proto: https。
+    # 无法确认为明文 HTTP 时按 fail-safe 默认设置 secure=True，避免代理终止 HTTPS 后以 HTTP 转发导致 Cookie 明文传输。
+    is_https = (
+        request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    )
+
     # 设置会话级别的 HttpOnly Cookie
     response.set_cookie(
         key=settings.PROJECT_NAME,
         value=resource_token,
         httponly=True,
-        secure=request.url.scheme == "https",  # 根据当前请求的协议设置 secure 属性
+        secure=is_https,  # 根据当前请求协议（含反向代理转发标识）设置 secure 属性
         samesite="lax"  # 不同浏览器对 "Strict" 的处理可能不同，设置 SameSite 为 "Lax"，以平衡安全性和兼容性
     )
 
@@ -258,7 +267,7 @@ def verify_token(
         payload = __verify_token(token=jwt_token, purpose="authentication")
 
         # 如果没有 resource_token，生成并写入到 Cookie
-        __set_or_refresh_resource_token_cookie(request, response, payload)
+        set_or_refresh_resource_token_cookie(request, response, payload)
 
         return payload
     elif api_key:

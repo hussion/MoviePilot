@@ -2,15 +2,17 @@ import base64
 import copy
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Set, Dict, Union
 
 from app import schemas
 from app.chain import ChainBase
+from app.chain.storage import StorageChain
 from app.core.cache import FileCache
 from app.core.config import settings, global_vars
-from app.core.context import MediaInfo, TorrentInfo, Context
+from app.core.context import MediaInfo, SubtitleInfo, TorrentInfo, Context
 from app.core.event import eventmanager, Event
 from app.core.meta import MetaBase
 from app.core.metainfo import MetaInfo
@@ -20,18 +22,315 @@ from app.helper.directory import DirectoryHelper
 from app.helper.thread import ThreadHelper
 from app.helper.torrent import TorrentHelper
 from app.log import logger
-from app.schemas import ExistMediaInfo, FileURI, NotExistMediaInfo, DownloadingTorrent, Notification, ResourceSelectionEventData, \
+from app.schemas import ExistMediaInfo, FileURI, NotExistMediaInfo, DownloaderTorrent, Notification, ResourceSelectionEventData, \
     ResourceDownloadEventData
 from app.schemas.types import MediaType, TorrentStatus, EventType, MessageChannel, NotificationType, ContentType, \
     ChainEventType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
+from app.utils.system import SystemUtils
 
 
 class DownloadChain(ChainBase):
     """
     下载处理链
     """
+
+    _SUBTITLE_ARCHIVE_FORMATS = {
+        ".zip": "zip",
+        ".rar": "rar",
+    }
+
+    @staticmethod
+    def _safe_subtitle_file_name(file_name: str, fallback_name: str) -> str:
+        """
+        生成安全的字幕文件名。
+        """
+        file_name = Path(file_name or fallback_name).name
+        if not Path(file_name).suffix and Path(fallback_name).suffix:
+            file_name = f"{file_name}{Path(fallback_name).suffix}"
+        return file_name
+
+    @staticmethod
+    def _is_subtitle_archive(file_name: str) -> bool:
+        """
+        判断是否为字幕压缩包。
+        """
+        return Path(file_name).suffix.lower() in DownloadChain._SUBTITLE_ARCHIVE_FORMATS
+
+    @classmethod
+    def _subtitle_archive_format(cls, file_name: str) -> Optional[str]:
+        """
+        获取字幕压缩包格式。
+        """
+        return cls._SUBTITLE_ARCHIVE_FORMATS.get(Path(file_name).suffix.lower())
+
+    @staticmethod
+    def _is_subtitle_file(file_name: str) -> bool:
+        """
+        判断是否为支持的字幕文件。
+        """
+        return Path(file_name).suffix.lower() in settings.RMT_SUBEXT
+
+    @classmethod
+    def _get_subtitle_working_dir(
+            cls,
+            storage_chain: StorageChain,
+            storage: str,
+            target_path: Path,
+    ) -> Tuple[Optional[schemas.FileItem], str]:
+        """
+        获取字幕保存目录，返回失败原因供前端展示。
+        """
+        try:
+            working_dir_item = storage_chain.get_folder(storage, target_path)
+        except Exception as err:
+            message = f"下载目录获取失败，无法保存字幕：{target_path} - {str(err)}"
+            logger.error(message)
+            return None, message
+
+        if not working_dir_item:
+            message = f"下载目录不存在，无法保存字幕：{target_path}"
+            logger.error(message)
+            return None, message
+        return working_dir_item, ""
+
+    @staticmethod
+    def _detect_subtitle_fallback_name(subtitle: SubtitleInfo, content: bytes) -> str:
+        """
+        根据响应内容生成兜底字幕文件名。
+        """
+        suffix = ".zip" if content.startswith(b"PK") else ".srt"
+        return f"{subtitle.title or subtitle.subtitle_id or 'subtitle'}{suffix}"
+
+    @staticmethod
+    def _resolve_media_download_dir(
+            media_info: MediaInfo,
+            save_path: Optional[str] = None,
+    ) -> Union[str, Path]:
+        """
+        根据媒体信息解析下载目录。
+        """
+        storage = 'local'
+        if save_path:
+            return storage, Path(save_path)
+
+        dir_info = DirectoryHelper().get_dir(media_info, include_unsorted=True)
+        storage = dir_info.storage if dir_info else storage
+        if not dir_info:
+            logger.error(f"未找到下载目录：{media_info.type.value} {media_info.title_year}")
+            return None
+
+        if not dir_info.media_type and dir_info.download_type_folder:
+            download_dir = Path(dir_info.download_path) / media_info.type.value
+        else:
+            download_dir = Path(dir_info.download_path)
+
+        if not dir_info.media_category and dir_info.download_category_folder and media_info.category:
+            download_dir = download_dir / media_info.category
+
+        return storage, download_dir
+
+    @staticmethod
+    def _upload_subtitle_file(
+            storage_chain: StorageChain,
+            storage: str,
+            working_dir_item: schemas.FileItem,
+            subtitle_file: Path,
+    ) -> Tuple[Optional[str], str]:
+        """
+        上传单个字幕文件到目标目录。
+        """
+        target_sub_file = Path(working_dir_item.path) / subtitle_file.name
+        if storage_chain.get_file_item(storage, target_sub_file):
+            logger.info(f"字幕文件已存在：{target_sub_file}")
+            return target_sub_file.as_posix(), ""
+        logger.info(f"转移字幕 {subtitle_file} 到 {target_sub_file} ...")
+        uploaded = storage_chain.upload_file(working_dir_item, subtitle_file)
+        if uploaded:
+            return uploaded.path, ""
+        message = f"保存字幕文件失败：{target_sub_file}"
+        logger.error(message)
+        return None, message
+
+    @staticmethod
+    def _build_subtitle_download_error(response) -> str:
+        """
+        从字幕下载响应中提取前端可展示的失败原因。
+        """
+        status_code = getattr(response, "status_code", None)
+        reason = getattr(response, "reason", "") or ""
+        message = "下载字幕文件失败"
+        if status_code:
+            message = f"{message}，状态码：{status_code}"
+            if reason:
+                message = f"{message} {reason}"
+        try:
+            response_text = (getattr(response, "text", "") or "").strip()
+            response_text = re.sub(r"\s+", " ", response_text)
+            if response_text:
+                message = f"{message}：{response_text[:200]}"
+        except Exception as err:
+            logger.debug(f"读取字幕下载失败响应内容失败：{str(err)}")
+        return message
+
+    def _save_subtitle_response(
+            self,
+            subtitle: SubtitleInfo,
+            response,
+            storage: str,
+            target_dir: Path,
+    ) -> Tuple[bool, str, List[str]]:
+        """
+        保存字幕下载响应到目标目录。
+        """
+        fallback_name = self._detect_subtitle_fallback_name(subtitle, response.content)
+        file_name = subtitle.file_name or TorrentHelper.get_url_filename(response, subtitle.enclosure)
+        if not Path(file_name).suffix:
+            file_name = fallback_name
+        file_name = self._safe_subtitle_file_name(
+            file_name=file_name,
+            fallback_name=fallback_name,
+        )
+        if not self._is_subtitle_archive(file_name) and not self._is_subtitle_file(file_name):
+            message = f"下载链接不是支持的字幕文件：{file_name}"
+            logger.warn(f"{message}，链接：{subtitle.enclosure}")
+            return False, message, []
+
+        storage_chain = StorageChain()
+        working_dir_item, message = self._get_subtitle_working_dir(
+            storage_chain=storage_chain,
+            storage=storage,
+            target_path=target_dir,
+        )
+        if not working_dir_item:
+            return False, message, []
+
+        saved_files = []
+        temp_file = settings.TEMP_PATH / file_name
+        temp_extract_dir = temp_file.with_name(temp_file.stem)
+        try:
+            settings.TEMP_PATH.mkdir(parents=True, exist_ok=True)
+            temp_file.write_bytes(response.content)
+            if self._is_subtitle_archive(file_name):
+                try:
+                    SystemUtils.unpack_archive(
+                        temp_file,
+                        temp_extract_dir,
+                        archive_format=self._subtitle_archive_format(file_name),
+                    )
+                except Exception as err:
+                    message = f"字幕压缩包解压失败：{str(err)}"
+                    logger.error(f"{message}，文件：{temp_file}")
+                    return False, message, []
+                for sub_file in SystemUtils.list_files(temp_extract_dir, settings.RMT_SUBEXT):
+                    uploaded_path, message = self._upload_subtitle_file(
+                        storage_chain=storage_chain,
+                        storage=storage,
+                        working_dir_item=working_dir_item,
+                        subtitle_file=sub_file,
+                    )
+                    if uploaded_path:
+                        saved_files.append(uploaded_path)
+                    elif message:
+                        logger.error(message)
+            else:
+                uploaded_path, message = self._upload_subtitle_file(
+                    storage_chain=storage_chain,
+                    storage=storage,
+                    working_dir_item=working_dir_item,
+                    subtitle_file=temp_file,
+                )
+                if uploaded_path:
+                    saved_files.append(uploaded_path)
+                elif message:
+                    return False, message, []
+            if not saved_files:
+                message = "未保存任何字幕文件"
+                logger.error(message)
+                return False, message, []
+            return True, "字幕文件保存成功", saved_files
+        except Exception as err:
+            message = f"保存字幕文件失败：{str(err)}"
+            logger.error(message)
+            return False, message, []
+        finally:
+            try:
+                if temp_extract_dir.exists():
+                    shutil.rmtree(temp_extract_dir)
+                if temp_file.exists():
+                    temp_file.unlink()
+            except Exception as err:
+                logger.error(f"删除临时字幕文件失败：{str(err)}")
+
+    def download_subtitle(
+            self,
+            subtitle: SubtitleInfo,
+            tmdbid: Optional[int] = None,
+            doubanid: Optional[str] = None,
+            save_path: Optional[str] = None,
+            username: Optional[str] = None,
+    ) -> Tuple[bool, str, List[str]]:
+        """
+        下载字幕文件并保存到媒体对应的下载目录。
+
+        :param subtitle: 字幕搜索结果
+        :param tmdbid: TMDB ID
+        :param doubanid: 豆瓣 ID
+        :param save_path: 保存路径
+        :param username: 调用下载的用户名
+        :return: 成功状态、提示消息、保存文件列表
+        """
+        if not subtitle or not subtitle.enclosure:
+            return False, "字幕下载链接为空", []
+
+        metainfo = MetaInfo(title=subtitle.title, subtitle=subtitle.description)
+        mediainfo = self.recognize_media(
+            meta=metainfo,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+        )
+        if not mediainfo:
+            return False, "无法识别媒体信息", []
+
+        storage, target_dir = self._resolve_media_download_dir(
+            media_info=mediainfo,
+            save_path=save_path,
+        )
+        if not target_dir:
+            return False, "未找到下载目录", []
+
+        request = RequestUtils(
+            cookies=subtitle.site_cookie,
+            ua=subtitle.site_ua or settings.USER_AGENT,
+            proxies=settings.PROXY if subtitle.site_proxy else None,
+        )
+        try:
+            response = request.get_res(subtitle.enclosure, raise_exception=True)
+        except Exception as err:
+            message = f"下载字幕文件失败：{str(err)}"
+            logger.error(message)
+            return False, message, []
+        if response is None:
+            return False, "下载字幕文件失败：未收到站点响应", []
+        if response.status_code != 200:
+            message = self._build_subtitle_download_error(response)
+            logger.error(message)
+            return False, message, []
+
+        success, message, saved_files = self._save_subtitle_response(
+            subtitle=subtitle,
+            response=response,
+            storage=storage,
+            target_dir=target_dir,
+        )
+        if not success:
+            return False, message, []
+
+        logger.info(
+            f"{mediainfo.title_year} 字幕下载完成：{subtitle.site_name} - {subtitle.title}，用户：{username}"
+        )
+        return True, "字幕下载成功", saved_files
 
     def _submit_download_added_task(
             self,
@@ -50,8 +349,8 @@ class DownloadChain(ChainBase):
                     download_dir=download_dir,
                     torrent_content=torrent_content,
                 )
-            except Exception as err:
-                logger.error(f"执行下载成功后处理失败：{str(err)}")
+            except Exception as e:
+                logger.error(f"执行下载成功后处理失败：{str(e)}")
 
         try:
             ThreadHelper().submit(_run_download_added)
@@ -179,7 +478,8 @@ class DownloadChain(ChainBase):
                         userid: Union[str, int] = None,
                         username: Optional[str] = None,
                         label: Optional[str] = None,
-                        return_detail: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
+                        return_detail: bool = False,
+                        custom_words: Optional[str] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
         """
         下载及发送通知
         :param context: 资源上下文
@@ -194,6 +494,7 @@ class DownloadChain(ChainBase):
         :param username: 调用下载的用户名/插件名
         :param label: 自定义标签
         :param return_detail: 是否返回详细结果；False 时返回下载任务 hash 或 None，True 时返回 (hash, error_msg)
+        :param custom_words: 下载来源（如订阅）的完整自定义识别词文本，随下载记录存档，供整理时原样复现识别
         :return: return_detail=False 时返回下载任务 hash 或 None；return_detail=True 时返回 (hash, error_msg)
         """
         _torrent = context.torrent_info
@@ -350,7 +651,8 @@ class DownloadChain(ChainBase):
                 date=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                 media_category=_media.category,
                 episode_group=_media.episode_group,
-                note={"source": source}
+                note={"source": source},
+                custom_words=custom_words
             )
 
             # 登记下载文件
@@ -439,7 +741,8 @@ class DownloadChain(ChainBase):
                        source: Optional[str] = None,
                        userid: Optional[str] = None,
                        username: Optional[str] = None,
-                       downloader: Optional[str] = None
+                       downloader: Optional[str] = None,
+                       custom_words: Optional[str] = None
                        ) -> Tuple[List[Context], Dict[Union[int, str], Dict[int, NotExistMediaInfo]]]:
         """
         根据缺失数据，自动种子列表中组合择优下载
@@ -451,6 +754,7 @@ class DownloadChain(ChainBase):
         :param userid:  用户ID
         :param username: 调用下载的用户名/插件名
         :param downloader: 下载器
+        :param custom_words: 下载来源（如订阅）的完整自定义识别词文本，随下载记录存档，供整理时原样复现识别
         :return: 已经下载的资源列表、剩余未下载到的剧集 no_exists[tmdb_id/douban_id] = {season: NotExistMediaInfo}
         """
         # 已下载的项目
@@ -492,7 +796,8 @@ class DownloadChain(ChainBase):
                     season=not_exist.season,
                     episodes=need,
                     total_episode=not_exist.total_episode,
-                    start_episode=not_exist.start_episode
+                    start_episode=not_exist.start_episode,
+                    require_complete_coverage=not_exist.require_complete_coverage
                 )
             else:
                 no_exists[_mid].pop(_sea)
@@ -511,6 +816,34 @@ class DownloadChain(ChainBase):
                 return 9999
             return no_exist[season].total_episode
 
+        def __get_no_exist_media(_mid: Union[int, str], season: int) -> Optional[NotExistMediaInfo]:
+            """
+            获取指定媒体和季的缺失信息。
+            """
+            if not no_exists or not no_exists.get(_mid):
+                return None
+            return no_exists.get(_mid).get(season)
+
+        def __get_required_episodes(_mid: Union[int, str], season: int) -> Set[int]:
+            """
+            获取整季候选必须覆盖的目标集范围。
+            """
+            tv = __get_no_exist_media(_mid, season)
+            if not tv:
+                return set()
+            if not tv.total_episode:
+                return set()
+            start = tv.start_episode or 1
+            return set(range(start, tv.total_episode + 1))
+
+        def __requires_complete_coverage(_tv: Optional[NotExistMediaInfo]) -> bool:
+            """
+            判断当前缺失范围是否要求候选资源完整覆盖目标范围。
+            """
+            if not _tv:
+                return False
+            return bool(_tv.require_complete_coverage)
+
         def __apply_allowed_episodes(_need_episodes, _context: Context) -> Set[int]:
             """
             根据候选携带的允许集裁剪 need_episodes，返回真正可下载的剧集集合。
@@ -524,6 +857,12 @@ class DownloadChain(ChainBase):
             if allowed is not None:
                 effective &= set(allowed)
             return effective
+
+        def __get_movie_download_key(_context: Context) -> str:
+            """
+            获取电影下载去重键，确保失败候选不会阻断后续同名资源尝试。
+            """
+            return _context.media_info.title_year
 
         # 发送资源选择事件，允许外部修改上下文数据
         logger.debug(f"Initial contexts: {len(contexts)} items, Downloader: {downloader}")
@@ -541,21 +880,26 @@ class DownloadChain(ChainBase):
                              f"{len(event_data.updated_contexts)} items (source: {event_data.source})")
                 contexts = event_data.updated_contexts
 
-        # 分组排序
-        contexts = TorrentHelper().sort_group_torrents(contexts)
+        # 仅排序，不提前按媒体控重；下载失败时需要继续尝试同组后续候选。
+        contexts = TorrentHelper().sort_torrents(contexts)
 
         # 如果是电影，直接下载
+        downloaded_movies = set()
         for context in contexts:
             if global_vars.is_system_stopped:
                 break
             if context.media_info.type == MediaType.MOVIE:
+                movie_key = __get_movie_download_key(context)
+                if movie_key in downloaded_movies:
+                    continue
                 logger.info(f"开始下载电影 {context.torrent_info.title} ...")
                 if self.download_single(context, save_path=save_path, channel=channel,
                                         source=source, userid=userid, username=username,
-                                        downloader=downloader):
+                                        downloader=downloader, custom_words=custom_words):
                     # 下载成功
                     logger.info(f"{context.torrent_info.title} 添加下载成功")
                     downloaded_list.append(context)
+                    downloaded_movies.add(movie_key)
 
         # 电视剧整季匹配
         if no_exists:
@@ -602,6 +946,7 @@ class DownloadChain(ChainBase):
                             continue
                         # 种子季是需要季或者子集
                         if set(torrent_season).issubset(set(need_season)):
+                            complete_coverage_matched = False
                             if len(torrent_season) == 1:
                                 # 只有一季的可能是命名错误，需要打开种子鉴别，只有实际集数大于等于总集数才下载
                                 logger.info(f"开始下载种子 {torrent.title} ...")
@@ -616,13 +961,29 @@ class DownloadChain(ChainBase):
                                 logger.info(f"{meta.org_string} 解析种子文件集数为 {torrent_episodes}")
                                 if not torrent_episodes:
                                     continue
+                                torrent_episodes_set = set(torrent_episodes)
                                 # 更新集数范围
                                 begin_ep = min(torrent_episodes)
                                 end_ep = max(torrent_episodes)
                                 meta.set_episodes(begin=begin_ep, end=end_ep)
-                                # 需要总集数
+                                # 需要目标集范围；完整覆盖场景必须覆盖范围内每一集，不能只按数量判断。
+                                need_tv_info = __get_no_exist_media(need_mid, torrent_season[0])
+                                required_episodes = __get_required_episodes(need_mid, torrent_season[0]) \
+                                    if __requires_complete_coverage(need_tv_info) else set()
                                 need_total = __get_season_episodes(need_mid, torrent_season[0])
-                                if len(torrent_episodes) < need_total:
+                                complete_coverage_matched = bool(required_episodes) \
+                                    and required_episodes.issubset(torrent_episodes_set)
+                                if complete_coverage_matched:
+                                    logger.info(
+                                        f"{meta.org_string} 解析文件集数已完整覆盖目标范围："
+                                        f"{StringUtils.format_ep(sorted(required_episodes))}")
+                                if required_episodes and not complete_coverage_matched:
+                                    missing_episodes = sorted(required_episodes.difference(torrent_episodes_set))
+                                    logger.info(
+                                        f"{meta.org_string} 解析文件集数未覆盖目标范围，"
+                                        f"缺少 {StringUtils.format_ep(missing_episodes)}，先放弃这个种子")
+                                    continue
+                                if not required_episodes and need_total and len(torrent_episodes) < need_total:
                                     logger.info(
                                         f"{meta.org_string} 解析文件集数发现不是完整合集，先放弃这个种子")
                                     continue
@@ -637,7 +998,8 @@ class DownloadChain(ChainBase):
                                         source=source,
                                         userid=userid,
                                         username=username,
-                                        downloader=downloader
+                                        downloader=downloader,
+                                        custom_words=custom_words
                                     )
                             else:
                                 # 下载
@@ -645,10 +1007,13 @@ class DownloadChain(ChainBase):
                                 download_id = self.download_single(context, save_path=save_path,
                                                                    channel=channel, source=source,
                                                                    userid=userid, username=username,
-                                                                   downloader=downloader)
+                                                                   downloader=downloader,
+                                                                   custom_words=custom_words)
 
                             if download_id:
                                 # 下载成功
+                                if complete_coverage_matched:
+                                    context.confirmed_full_coverage = True
                                 logger.info(f"{torrent.title} 添加下载成功")
                                 downloaded_list.append(context)
                                 # 更新仍需季集
@@ -713,16 +1078,26 @@ class DownloadChain(ChainBase):
                             effective_need = __apply_allowed_episodes(need_episodes, context)
                             if not effective_need:
                                 continue
-                            # 为需要集的子集则下载
-                            if torrent_episodes.issubset(effective_need):
+                            if __requires_complete_coverage(tv):
+                                # 完整覆盖任务要求候选集数覆盖目标范围，允许资源包含范围外的额外集。
+                                required_episodes = __get_required_episodes(need_mid, need_season)
+                                match_episodes = required_episodes.issubset(torrent_episodes) \
+                                    if required_episodes else False
+                            else:
+                                # 普通缺集下载保持原语义：候选自身必须是所需集的子集。
+                                match_episodes = torrent_episodes.issubset(effective_need)
+                            if match_episodes:
                                 # 下载
                                 logger.info(f"开始下载 {meta.title} ...")
                                 download_id = self.download_single(context, save_path=save_path,
                                                                    channel=channel, source=source,
                                                                    userid=userid, username=username,
-                                                                   downloader=downloader)
+                                                                   downloader=downloader,
+                                                                   custom_words=custom_words)
                                 if download_id:
                                     # 下载成功
+                                    if __requires_complete_coverage(tv):
+                                        context.confirmed_full_coverage = True
                                     logger.info(f"{meta.title} 添加下载成功")
                                     downloaded_list.append(context)
                                     # 更新仍需集数
@@ -752,6 +1127,8 @@ class DownloadChain(ChainBase):
                     need_season = sea
                     # 当前需要集
                     need_episodes = tv.episodes
+                    if __requires_complete_coverage(tv):
+                        continue
                     # 没有集的不处理
                     if not need_episodes:
                         continue
@@ -813,7 +1190,8 @@ class DownloadChain(ChainBase):
                                 source=source,
                                 userid=userid,
                                 username=username,
-                                downloader=downloader
+                                downloader=downloader,
+                                custom_words=custom_words
                             )
                             if not download_id:
                                 continue
@@ -979,7 +1357,8 @@ class DownloadChain(ChainBase):
                 mtype=NotificationType.Download,
                 title="没有正在下载的任务！",
                 userid=userid,
-                link=settings.MP_DOMAIN('#/downloading')
+                link=settings.MP_DOMAIN('#/downloading'),
+                save_history=False,
             ))
             return
         # 发送消息
@@ -998,10 +1377,11 @@ class DownloadChain(ChainBase):
             title=title,
             text="\n".join(messages),
             userid=userid,
-            link=settings.MP_DOMAIN('#/downloading')
+            link=settings.MP_DOMAIN('#/downloading'),
+            save_history=False,
         ))
 
-    def downloading(self, name: Optional[str] = None) -> List[DownloadingTorrent]:
+    def downloading(self, name: Optional[str] = None) -> List[DownloaderTorrent]:
         """
         查询正在下载的任务
         """
@@ -1059,7 +1439,7 @@ class DownloadChain(ChainBase):
             return
         logger.warn(f"检测到下载源文件被删除，删除下载任务（不含文件）：{hash_str}")
         # 先查询种子
-        torrents: List[schemas.TransferTorrent] = self.list_torrents(hashs=[hash_str])
+        torrents: List[schemas.DownloaderTorrent] = self.list_torrents(hashs=[hash_str])
         if torrents:
             self.remove_torrents(hashs=[hash_str], delete_file=False)
             # 发出下载任务删除事件，如需处理辅种，可监听该事件

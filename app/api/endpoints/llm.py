@@ -24,6 +24,10 @@ router = APIRouter()
 
 
 class LlmTestRequest(BaseModel):
+    """
+    LLM 测试调用请求参数。
+    """
+
     enabled: Optional[bool] = None
     provider: Optional[str] = None
     model: Optional[str] = None
@@ -31,19 +35,25 @@ class LlmTestRequest(BaseModel):
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     base_url_preset: Optional[str] = None
+    user_agent: Optional[str] = None
+    use_proxy: Optional[bool] = None
 
 
 class LlmProviderAuthStartRequest(BaseModel):
+    """
+    LLM 提供商授权启动请求参数。
+    """
+
     provider: str
     method: str
 
 
-def _sanitize_llm_test_error(message: str, api_key: Optional[str] = None) -> str:
+def _sanitize_llm_error(message: str, api_key: Optional[str] = None) -> str:
     """
     清理错误信息中的敏感字段，避免回显密钥。
     """
     if not message:
-        return "LLM 调用失败"
+        return "LLM 没有返回任何内容"
 
     sanitized = message
     if api_key:
@@ -58,6 +68,17 @@ def _sanitize_llm_test_error(message: str, api_key: Optional[str] = None) -> str
         "Authorization: ***",
         sanitized,
     )
+
+    normalized_message = sanitized.lower().replace("_", "").replace(" ", "")
+    if "str" in normalized_message and (
+        "modeldump" in normalized_message
+        or "setprivateattributes" in normalized_message
+    ):
+        return (
+            "服务返回内容不是兼容的模型响应，请检查基础地址是否填写为 "
+            "API Base URL，如果服务要求 /v1 等版本路径，请包含在基础地址中，"
+            "不要填写网页地址或完整的 chat/completions 路径"
+        )
     return sanitized
 
 
@@ -67,6 +88,8 @@ async def get_llm_models(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     base_url_preset: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    use_proxy: Optional[bool] = None,
     force_refresh: Optional[bool] = False,
     _: User = Depends(get_current_active_user_async),
 ):
@@ -80,6 +103,8 @@ async def get_llm_models(
             api_key=api_key,
             base_url=base_url,
             base_url_preset=base_url_preset,
+            user_agent=user_agent,
+            use_proxy=use_proxy,
             force_refresh=bool(force_refresh),
         )
         return schemas.Response(
@@ -91,7 +116,10 @@ async def get_llm_models(
             },
         )
     except Exception as err:
-        return schemas.Response(success=False, message=str(err))
+        return schemas.Response(
+            success=False,
+            message=_sanitize_llm_error(str(err), api_key),
+        )
 
 
 @router.get("/providers", summary="获取LLM提供商目录", response_model=schemas.Response)
@@ -238,6 +266,8 @@ async def llm_test(
         api_key=settings.LLM_API_KEY,
         base_url=settings.LLM_BASE_URL,
         base_url_preset=settings.LLM_BASE_URL_PRESET,
+        user_agent=settings.LLM_USER_AGENT,
+        use_proxy=settings.LLM_USE_PROXY,
     )
 
     if not payload.provider:
@@ -269,6 +299,8 @@ async def llm_test(
             api_key=payload.api_key,
             base_url=payload.base_url,
             base_url_preset=payload.base_url_preset,
+            user_agent=payload.user_agent,
+            use_proxy=payload.use_proxy,
         )
         if not result.get("reply_preview"):
             return schemas.Response(
@@ -286,5 +318,5 @@ async def llm_test(
     except Exception as err:
         return schemas.Response(
             success=False,
-            message=_sanitize_llm_test_error(str(err), payload.api_key),
+            message=_sanitize_llm_error(str(err), payload.api_key),
         )

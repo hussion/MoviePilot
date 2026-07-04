@@ -2,12 +2,11 @@ import re
 import traceback
 from typing import Optional, List
 
-import zhconv
-
 from app.core.config import settings
 from app.log import logger
 from app.schemas.types import MediaType
 from app.utils.string import StringUtils
+from app.utils.zhconv import convert as zhconv_convert
 from .tmdbv3api import TMDb, Search, Movie, TV, Season, Episode, Discover, Trending, Person, Collection
 from .tmdbv3api.exceptions import TMDbException
 
@@ -200,55 +199,45 @@ class TmdbApi:
             ret_info['media_type'] = MediaType.MOVIE if ret_info.get("media_type") == "movie" else MediaType.TV
         return ret_info
 
-    def _match_multi_item(self, name: str, multi: dict, get_info_func) -> Optional[dict]:
+    @staticmethod
+    def _match_multi_title(name_compare_func, name: str, multi: dict) -> bool:
         """
-        匹配单个多媒体搜索结果项
-        :param name: 查询名称
-        :param multi: 搜索结果项
-        :param get_info_func: 获取详细信息的函数（同步或异步）
-        :return: 匹配的结果或None
+        匹配单个多媒体搜索结果项的标题/原标题
         """
         if multi.get("media_type") == "movie":
-            if self.__compare_names(name, multi.get('title')) \
-                    or self.__compare_names(name, multi.get('original_title')):
-                return multi
-            # 匹配别名、译名
+            return (name_compare_func(name, multi.get('title'))
+                    or name_compare_func(name, multi.get('original_title')))
+        elif multi.get("media_type") == "tv":
+            return (name_compare_func(name, multi.get('name'))
+                    or name_compare_func(name, multi.get('original_name')))
+        return False
+
+    def _match_multi_names(self, name: str, multi: dict, get_info_func) -> Optional[dict]:
+        """
+        匹配单个多媒体搜索结果项的别名、译名
+        """
+        if multi.get("media_type") == "movie":
             if not multi.get("names"):
                 multi = get_info_func(mtype=MediaType.MOVIE, tmdbid=multi.get("id"))
             if multi and self.__compare_names(name, multi.get("names")):
                 return multi
         elif multi.get("media_type") == "tv":
-            if self.__compare_names(name, multi.get('name')) \
-                    or self.__compare_names(name, multi.get('original_name')):
-                return multi
-            # 匹配别名、译名
             if not multi.get("names"):
                 multi = get_info_func(mtype=MediaType.TV, tmdbid=multi.get("id"))
             if multi and self.__compare_names(name, multi.get("names")):
                 return multi
         return None
 
-    async def _async_match_multi_item(self, name: str, multi: dict) -> Optional[dict]:
+    async def _async_match_multi_names(self, name: str, multi: dict) -> Optional[dict]:
         """
-        匹配单个多媒体搜索结果项（异步版本）
-        :param name: 查询名称
-        :param multi: 搜索结果项
-        :return: 匹配的结果或None
+        匹配单个多媒体搜索结果项的别名、译名（异步版本）
         """
         if multi.get("media_type") == "movie":
-            if self.__compare_names(name, multi.get('title')) \
-                    or self.__compare_names(name, multi.get('original_title')):
-                return multi
-            # 匹配别名、译名
             if not multi.get("names"):
                 multi = await self.async_get_info(mtype=MediaType.MOVIE, tmdbid=multi.get("id"))
             if multi and self.__compare_names(name, multi.get("names")):
                 return multi
         elif multi.get("media_type") == "tv":
-            if self.__compare_names(name, multi.get('name')) \
-                    or self.__compare_names(name, multi.get('original_name')):
-                return multi
-            # 匹配别名、译名
             if not multi.get("names"):
                 multi = await self.async_get_info(mtype=MediaType.TV, tmdbid=multi.get("id"))
             if multi and self.__compare_names(name, multi.get("names")):
@@ -366,18 +355,18 @@ class TmdbApi:
                 key=lambda x: x.get('release_date') or '0000-00-00',
                 reverse=True
             )
+            # 过滤年份
+            if year:
+                movies = [m for m in movies
+                          if (m.get('release_date') or '')[0:4] == year]
+            # 第一轮：优先匹配标题、原标题
             for movie in movies:
-                # 年份
-                movie_year = movie.get('release_date')[0:4] if movie.get('release_date') else None
-                if year and movie_year != year:
-                    # 年份不匹配
-                    continue
-                # 匹配标题、原标题
                 if self.__compare_names(name, movie.get('title')):
                     return movie
                 if self.__compare_names(name, movie.get('original_title')):
                     return movie
-                # 匹配别名、译名
+            # 第二轮：匹配别名、译名
+            for movie in movies:
                 if not movie.get("names"):
                     movie = self.get_info(mtype=MediaType.MOVIE, tmdbid=movie.get("id"))
                 if movie and self.__compare_names(name, movie.get("names")):
@@ -413,17 +402,18 @@ class TmdbApi:
                 key=lambda x: x.get('first_air_date') or '0000-00-00',
                 reverse=True
             )
+            # 过滤年份
+            if year:
+                tvs = [t for t in tvs
+                       if (t.get('first_air_date') or '')[0:4] == year]
+            # 第一轮：优先匹配标题、原标题
             for tv in tvs:
-                tv_year = tv.get('first_air_date')[0:4] if tv.get('first_air_date') else None
-                if year and tv_year != year:
-                    # 年份不匹配
-                    continue
-                # 匹配标题、原标题
                 if self.__compare_names(name, tv.get('name')):
                     return tv
                 if self.__compare_names(name, tv.get('original_name')):
                     return tv
-                # 匹配别名、译名
+            # 第二轮：匹配别名、译名
+            for tv in tvs:
                 if not tv.get("names"):
                     tv = self.get_info(mtype=MediaType.TV, tmdbid=tv.get("id"))
                 if tv and self.__compare_names(name, tv.get("names")):
@@ -575,12 +565,19 @@ class TmdbApi:
         # 按年份降序排列，电影在前面
         multis = self._sort_multi_results(multis)
 
+        # 第一轮：优先匹配标题、原标题
         ret_info = {}
         for multi in multis:
-            matched = self._match_multi_item(name, multi, self.get_info)
-            if matched:
-                ret_info = matched
+            if self._match_multi_title(self.__compare_names, name, multi):
+                ret_info = multi
                 break
+        # 第二轮：匹配别名、译名
+        if not ret_info:
+            for multi in multis:
+                matched = self._match_multi_names(name, multi, self.get_info)
+                if matched:
+                    ret_info = matched
+                    break
 
         # 类型变更
         return self._convert_media_type(ret_info)
@@ -728,7 +725,7 @@ class TmdbApi:
                 if iso_3166_1 == "CN":
                     title = alternative_title.get("title")
                     if title and StringUtils.is_chinese(title) \
-                            and zhconv.convert(title, "zh-hans") == title:
+                            and zhconv_convert(title, "zh-hans") == title:
                         return title
             return tmdbinfo.get("title") if tmdbinfo.get("media_type") == MediaType.MOVIE else tmdbinfo.get("name")
 
@@ -1521,18 +1518,18 @@ class TmdbApi:
                 key=lambda x: x.get('release_date') or '0000-00-00',
                 reverse=True
             )
+            # 过滤年份
+            if year:
+                movies = [m for m in movies
+                          if (m.get('release_date') or '')[0:4] == year]
+            # 第一轮：优先匹配标题、原标题
             for movie in movies:
-                # 年份
-                movie_year = movie.get('release_date')[0:4] if movie.get('release_date') else None
-                if year and movie_year != year:
-                    # 年份不匹配
-                    continue
-                # 匹配标题、原标题
                 if self.__compare_names(name, movie.get('title')):
                     return movie
                 if self.__compare_names(name, movie.get('original_title')):
                     return movie
-                # 匹配别名、译名
+            # 第二轮：匹配别名、译名
+            for movie in movies:
                 if not movie.get("names"):
                     movie = await self.async_get_info(mtype=MediaType.MOVIE, tmdbid=movie.get("id"))
                 if movie and self.__compare_names(name, movie.get("names")):
@@ -1568,17 +1565,18 @@ class TmdbApi:
                 key=lambda x: x.get('first_air_date') or '0000-00-00',
                 reverse=True
             )
+            # 过滤年份
+            if year:
+                tvs = [t for t in tvs
+                       if (t.get('first_air_date') or '')[0:4] == year]
+            # 第一轮：优先匹配标题、原标题
             for tv in tvs:
-                tv_year = tv.get('first_air_date')[0:4] if tv.get('first_air_date') else None
-                if year and tv_year != year:
-                    # 年份不匹配
-                    continue
-                # 匹配标题、原标题
                 if self.__compare_names(name, tv.get('name')):
                     return tv
                 if self.__compare_names(name, tv.get('original_name')):
                     return tv
-                # 匹配别名、译名
+            # 第二轮：匹配别名、译名
+            for tv in tvs:
                 if not tv.get("names"):
                     tv = await self.async_get_info(mtype=MediaType.TV, tmdbid=tv.get("id"))
                 if tv and self.__compare_names(name, tv.get("names")):
@@ -1897,12 +1895,19 @@ class TmdbApi:
         # 按年份降序排列，电影在前面
         multis = self._sort_multi_results(multis)
 
+        # 第一轮：优先匹配标题、原标题
         ret_info = {}
         for multi in multis:
-            matched = await self._async_match_multi_item(name, multi)
-            if matched:
-                ret_info = matched
+            if self._match_multi_title(self.__compare_names, name, multi):
+                ret_info = multi
                 break
+        # 第二轮：匹配别名、译名
+        if not ret_info:
+            for multi in multis:
+                matched = await self._async_match_multi_names(name, multi)
+                if matched:
+                    ret_info = matched
+                    break
 
         # 类型变更
         return self._convert_media_type(ret_info)
@@ -2217,4 +2222,17 @@ class TmdbApi:
         """
         关闭连接
         """
-        self.tmdb.close()
+        for client in (
+            self.tmdb,
+            self.search,
+            self.movie,
+            self.tv,
+            self.season_obj,
+            self.episode_obj,
+            self.discover,
+            self.trending,
+            self.person,
+            self.collection,
+        ):
+            if client:
+                client.close()

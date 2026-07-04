@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import queue
 import re
@@ -179,6 +180,8 @@ class TemplateContextBuilder:
             "season_fmt": meta.season,
             # 集号
             "episode": meta.episode_seqs,
+            # 当前季总集数
+            "total_episodes": len(episodes) if episodes else 0,
             # 季集 SxxExx
             "season_episode": "%s%s" % (meta.season, meta.episode),
             # 段/节
@@ -700,9 +703,20 @@ class MessageQueueManager(metaclass=SingletonClass):
 
     async def async_send_message(self, *args, **kwargs) -> None:
         """
-        异步发送消息（直接加入队列）
+        异步发送消息：``immediately=True`` 立即发送，否则按调度时段入队。
+
+        历史实现把 ``immediately`` 标志直接 pop 后丢弃，所有异步消息一律
+        进队列；如果调用时落在用户配置的"免打扰时段"之外，消息会一直挂
+        着不发。这里与同步 ``send_message`` 行为对齐：
+        指定 ``immediately=True`` 必须当场发出，与时段无关。
         """
-        kwargs.pop("immediately", False)
+        immediately = kwargs.pop("immediately", False)
+        if immediately or self._is_in_scheduled_time(datetime.now()):
+            # _send 会执行具体渠道回调，可能包含网络 IO；放到 executor
+            # 避免 async 调用方所在事件循环被同步发送阻塞。
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: self._send(*args, **kwargs))
+            return
         self.queue.put({
             "args": args,
             "kwargs": kwargs
@@ -752,61 +766,74 @@ class MessageQueueManager(metaclass=SingletonClass):
 
 class MessageHelper(metaclass=Singleton):
     """
-    消息队列管理器，包括系统消息和用户消息
+    消息队列管理器，负责系统和插件实时消息的 SSE 推送
     """
 
     def __init__(self):
         self.sys_queue = queue.Queue()
-        self.user_queue = queue.Queue()
+        self._recent_notification_keys = TTLCache(region="message:notification", maxsize=500, ttl=60)
+
+    @staticmethod
+    def _build_system_notification_key(
+            message: Any, role: str, title: str = None, note: Union[list, dict] = None
+    ) -> str:
+        """
+        构建系统通知短期去重键。
+        """
+        return json.dumps(
+            {
+                "role": role,
+                "title": title or "",
+                "text": str(message),
+                "note": note or {},
+                "time": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _is_recent_system_notification(
+            self, message: Any, role: str, title: str = None, note: Union[list, dict] = None
+    ) -> bool:
+        """
+        判断系统通知是否在短时间内重复。
+        """
+        key = self._build_system_notification_key(message, role, title=title, note=note)
+        if self._recent_notification_keys.get(key):
+            return True
+        self._recent_notification_keys.set(key, True)
+        return False
 
     def put(self, message: Any, role: str = "plugin", title: str = None, note: Union[list, dict] = None):
         """
         存消息
         :param message: 消息
-        :param role: 消息通道 systm：系统消息，plugin：插件消息，user：用户消息
+        :param role: 消息通道 system：系统消息，plugin：插件消息
         :param title: 标题
         :param note: 附件json
         """
-        if role in ["system", "plugin"]:
-            # 没有标题时获取插件名称
-            if role == "plugin" and not title:
-                title = "插件通知"
-            # 系统通知，默认
-            self.sys_queue.put(json.dumps({
-                "type": role,
-                "title": title,
-                "text": message,
-                "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                "note": note
-            }))
-        else:
-            if isinstance(message, str):
-                # 非系统的文本通知
-                self.user_queue.put(json.dumps({
-                    "title": title,
-                    "text": message,
-                    "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                    "note": note
-                }))
-            elif hasattr(message, "to_dict"):
-                # 非系统的复杂结构通知，如媒体信息/种子列表等。
-                content = message.to_dict()
-                content['title'] = title
-                content['date'] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                content['note'] = note
-                self.user_queue.put(json.dumps(content))
+        if role not in ["system", "plugin"]:
+            return
+        # 没有标题时获取插件名称
+        if role == "plugin" and not title:
+            title = "插件通知"
+        if self._is_recent_system_notification(message, role, title=title, note=note):
+            return
+        self.sys_queue.put(json.dumps({
+            "type": role,
+            "title": title,
+            "text": message,
+            "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "note": note
+        }))
 
     def get(self, role: str = "system") -> Optional[str]:
         """
         取消息
-        :param role: 消息通道 systm：系统消息，plugin：插件消息，user：用户消息
+        :param role: 兼容旧参数，当前所有 SSE 消息共用一个队列
         """
-        if role == "system":
-            if not self.sys_queue.empty():
-                return self.sys_queue.get(block=False)
-        else:
-            if not self.user_queue.empty():
-                return self.user_queue.get(block=False)
+        if not self.sys_queue.empty():
+            return self.sys_queue.get(block=False)
         return None
 
 

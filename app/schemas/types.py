@@ -43,6 +43,22 @@ class TorrentStatus(Enum):
     DOWNLOADING = "下载中"
 
 
+# 下载器任务查询状态
+class TorrentQueryStatus(Enum):
+    ALL = "all"
+    TRANSFER = "transfer"
+    DOWNLOADING = "downloading"
+    COMPLETED = "completed"
+    PAUSED = "paused"
+
+
+# 下载器任务归一状态
+class DownloadTaskState(Enum):
+    DOWNLOADING = "downloading"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
 # 异步广播事件
 class EventType(Enum):
     # 插件需要重载
@@ -105,6 +121,8 @@ class EventType(Enum):
     MessageAction = "message.action"
     # 执行工作流
     WorkflowExecute = "workflow.execute"
+    # Agent Tokens 用量
+    AgentTokensUsage = "agent.tokens.usage"
 
 
 # EventType中文名称翻译字典
@@ -139,11 +157,14 @@ EVENT_TYPE_NAMES = {
     EventType.ConfigChanged: "配置项更新",
     EventType.MessageAction: "消息交互动作",
     EventType.WorkflowExecute: "执行工作流",
+    EventType.AgentTokensUsage: "Agent Tokens 用量",
 }
 
 
 # 同步链式事件
 class ChainEventType(Enum):
+    # 插件数据重置前
+    PluginDataReset = "plugin.data.reset"
     # 名称识别
     NameRecognize = "name.recognize"
     # 认证验证
@@ -174,6 +195,12 @@ class ChainEventType(Enum):
     WorkflowExecution = "workflow.execution"
     # 存储操作选择
     StorageOperSelection = "storage.operation"
+    # Agent LLM 供应商选择
+    AgentLLMProvider = "agent.llm.provider"
+    # 订阅总集数刷新
+    SubscribeEpisodesRefresh = "subscribe.episodes.refresh"
+    # 订阅完成检查
+    SubscribeCompletionCheck = "subscribe.completion.check"
 
 
 # 系统配置Key字典
@@ -240,6 +267,8 @@ class SystemConfigKey(Enum):
     AIAgentConfig = "AIAgentConfig"
     # 通知消息格式模板
     NotificationTemplates = "NotificationTemplates"
+    # 通知中心清理时间
+    NotificationClearBefore = "NotificationClearBefore"
     # 刮削开关设置
     ScrapingSwitchs = "ScrapingSwitchs"
     # 插件安装统计
@@ -317,6 +346,7 @@ class MessageChannel(Enum):
     SynologyChat = "SynologyChat"
     VoceChat = "VoceChat"
     Web = "Web"
+    WebAgent = "WebAgent"
     WebPush = "WebPush"
     QQ = "QQ"
 
