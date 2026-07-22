@@ -110,21 +110,52 @@ MoviePilot 也提供普通 REST API 给前端和自动化客户端使用。所�
 
 FastAPI 异常响应保留 `detail` 字段，并在错误详情为文本时返回 `detail_i18n`；新版前端优先展示 `detail_i18n`，缺失时回退 `detail`。
 
+#### 媒体识别 / 整理
+
+媒体识别、搜索和手动整理内置支持 `themoviedb`、`douban`、`bangumi`、`anilist` 四种数据源，也允许插件处理自定义来源。自动识别仍使用系统默认来源；手动操作可通过请求级 `source` 或 `media_source` + `media_id` 临时指定来源，不修改系统默认值。
+
+涉及媒体身份的请求统一以 `media_source` + `media_id` 表示本次选定的主身份，同时保留 `tmdbid`、`doubanid`、`bangumiid`、`anilistid` 作为跨数据源映射和旧客户端兼容字段。两者并非两套独立数据流：显式通用主身份优先，专用 ID 用于补全映射和兼容回退。
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| GET | `/api/v1/media/search` | 按标题搜索媒体、合集或人物，参数：`title`、`type`、`page`、`count`，可选 `source`；`media` 支持 `themoviedb`、`douban`、`bangumi`、`anilist`，`collection` 支持 `themoviedb`，`person` 支持 `themoviedb`、`douban` |
+| GET | `/api/v1/media/recognize` | 识别标题，参数：`title`、`subtitle`、`custom_words`，可选 `source` |
+| GET | `/api/v1/media/recognize_file` | 识别文件路径，参数：`path`，可选 `source` |
+| GET | `/api/v1/media/{mediaid}` | 查询媒体详情，`mediaid` 支持 `tmdb:`、`douban:`、`bangumi:`、`anilist:` 及插件自定义来源前缀 |
+| POST | `/api/v1/media/scrape/{storage}` | 刮削媒体元数据；请求体为 `FileItem`，可选查询参数 `media_source`、`media_id`、`type_name`（电影/电视剧）可指定本次刮削媒体 |
+| POST | `/api/v1/transfer/manual/target-path` | 匹配手动整理目标路径；请求体可用 `media_source` + `media_id` 指定数据源原生ID |
+| POST | `/api/v1/transfer/manual` | 手动整理；请求体可用 `media_source` + `media_id` 指定本次识别与刮削数据源，同时兼容 `tmdbid`、`doubanid`、`bangumiid`、`anilistid` |
+
 #### 搜索 / 种子 / 字幕
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| GET | `/api/v1/search/media/{mediaid}` | 按媒体 ID 搜索站点种子资源，`mediaid` 支持 `tmdb:123`、`douban:123`、`bangumi:123`，参数：`mtype`、`area`、`title`、`year`、`season`、`sites` |
+| GET | `/api/v1/search/media/{mediaid}` | 按媒体 ID 搜索站点种子资源，`mediaid` 支持 `tmdb:123`、`douban:123`、`bangumi:123`、`anilist:123` 及插件来源前缀，参数：`mtype`、`area`、`title`、`year`、`season`、`sites` |
 | GET | `/api/v1/search/media/{mediaid}/stream` | 按媒体 ID 渐进式搜索站点种子资源，返回 SSE，参数同上 |
 | GET | `/api/v1/search/title` | 按关键字模糊搜索站点种子资源，参数：`keyword`、`page`、`sites` |
 | GET | `/api/v1/search/title/stream` | 按关键字渐进式搜索站点种子资源，返回 SSE，参数：`keyword`、`page`、`sites` |
 | GET | `/api/v1/search/subtitle/title` | 按关键字搜索站点字幕资源，参数：`keyword`、`page`、`sites` |
 | GET | `/api/v1/search/subtitle/title/stream` | 按关键字渐进式搜索站点字幕资源，返回 SSE，参数：`keyword`、`page`、`sites` |
-| GET | `/api/v1/search/subtitle/media/{mediaid}` | 按媒体 ID 精确搜索站点字幕资源，`mediaid` 支持 `tmdb:123`、`douban:123`、`bangumi:123`，参数：`mtype`、`title`、`year`、`season`、`episode`、`sites` |
+| GET | `/api/v1/search/subtitle/media/{mediaid}` | 按媒体 ID 精确搜索站点字幕资源，`mediaid` 支持四种内置来源及插件来源前缀，参数：`mtype`、`title`、`year`、`season`、`episode`、`sites` |
 | GET | `/api/v1/search/subtitle/media/{mediaid}/stream` | 按媒体 ID 渐进式精确搜索站点字幕资源，返回 SSE，参数同上 |
 | GET | `/api/v1/search/last` | 获取上一次种子搜索结果 |
 | GET | `/api/v1/search/last/context` | 获取上一次搜索结果及可复用搜索参数，`params.result_type` 为 `torrent` 或 `subtitle` |
 | POST | `/api/v1/search/recommend` | 获取 AI 推荐资源，请求体：`filtered_indices`、`check_only`、`force` |
+
+#### AniList 榜单 / 探索
+
+AniList 榜单、探索、详情、人物和推荐接口优先通过 `anilist-chinese` 代理查询。代理不可用时自动回退 AniList 官方 GraphQL，并合并 `anilist-chinese` 每日数据集；媒体标题优先使用项目提供的中文标题，未提供中文标题时回退 AniList 原语言标题。
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| GET | `/api/v1/anilist/trending` | 查询 TRENDING NOW 榜单，参数：`page`、`count` |
+| GET | `/api/v1/anilist/popular-this-season` | 查询 POPULAR THIS SEASON 榜单，参数：`page`、`count` |
+| GET | `/api/v1/anilist/discover` | 组合探索动画，参数：`search`、`genre`、`format`、`season`、`season_year`、`status`、`country`、`sort`、`page`、`count` |
+| GET | `/api/v1/anilist/{anilist_id}` | 查询动画详情 |
+| GET | `/api/v1/anilist/credits/{anilist_id}` | 查询日语配音演员，参数：`page`、`count` |
+| GET | `/api/v1/anilist/recommend/{anilist_id}` | 查询相关推荐，参数：`page`、`count` |
+| GET | `/api/v1/anilist/person/{person_id}` | 查询人物详情 |
+| GET | `/api/v1/anilist/person/credits/{person_id}` | 查询人物参与的动画作品，参数：`page`、`count` |
 
 #### 下载
 
@@ -132,8 +163,8 @@ FastAPI 异常响应保留 `detail` 字段，并在错误详情为文本时返�
 | :--- | :--- | :--- |
 | GET | `/api/v1/download/` | 查询正在下载的任务，参数：`name` |
 | POST | `/api/v1/download/` | 添加含媒体信息的下载任务，请求体包含媒体信息和种子信息 |
-| POST | `/api/v1/download/add` | 添加不含媒体信息的下载任务，请求体包含 `torrent_in`，可选 `tmdbid`、`doubanid`、`downloader`、`save_path` |
-| POST | `/api/v1/download/subtitle` | 下载字幕到识别出的媒体下载目录，请求体包含 `subtitle_in`，可选 `tmdbid`、`doubanid`、`save_path` |
+| POST | `/api/v1/download/add` | 添加不含媒体信息的下载任务，请求体包含 `torrent_in`，可选 `media_source` + `media_id`；继续兼容四种专用 ID，并支持 `downloader`、`save_path` |
+| POST | `/api/v1/download/subtitle` | 下载字幕到识别出的媒体下载目录，请求体包含 `subtitle_in`，可选 `media_source` + `media_id`；继续兼容四种专用 ID，并支持 `save_path` |
 | GET | `/api/v1/download/start/{hashString}` | 恢复下载任务，参数：`name` |
 | GET | `/api/v1/download/stop/{hashString}` | 暂停下载任务，参数：`name` |
 | GET | `/api/v1/download/clients` | 查询可用下载器 |
@@ -157,6 +188,16 @@ FastAPI 异常响应保留 `detail` 字段，并在错误详情为文本时返�
 | POST | `/api/v1/message/agent/mcp/servers` | 管理员保存 Agent 外部 MCP 服务器配置 |
 | POST | `/api/v1/message/agent/mcp/servers/test` | 管理员测试单个 Agent 外部 MCP 服务器并读取工具列表 |
 
+#### 缓存管理
+
+以下接口使用登录态鉴权，并要求当前用户为超级管理员。
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| GET | `/api/v1/tmdb/cache` | 查询 TheMovieDb 识别缓存及识别成功、失败条目统计 |
+| DELETE | `/api/v1/tmdb/cache/{cache_key}` | 按缓存键删除单条 TheMovieDb 识别缓存，缓存键需要进行 URL 编码 |
+| DELETE | `/api/v1/tmdb/cache` | 清空全部 TheMovieDb 识别缓存 |
+
 ### 插件补充接口
 
 **GET** `/api/v1/plugin/history/{plugin_id}`
@@ -170,6 +211,42 @@ FastAPI 异常响应保留 `detail` 字段，并在错误详情为文本时返�
 获取所有可用的MCP工具列表。
 
 工具的 `inputSchema` 只包含实际执行业务所需的参数，不包含用于解释调用原因的通用 `explanation` 参数，以减少 Agent 上下文消耗。
+
+媒体相关 MCP 工具（如 `query_media_detail`、`search_torrents`、`query_library_exists`、`add_subscribe`、`transfer_file`）接受 `tmdb_id`/`tmdbid`、`douban_id`/`doubanid`、`bangumi_id`/`bangumiid`、`anilist_id`/`anilistid`，也接受 `media_source` + `media_id`。工具返回的媒体、订阅、下载和整理记录会同步带回可用的四种专用 ID 及通用主身份。
+
+#### Agent 自主定时任务工具
+
+以下工具用于管理会在指定时间重新唤醒 Agent 的持久化任务，均为管理员级工具：
+
+| 工具 | 说明 |
+| :--- | :--- |
+| `create_agent_task` | 创建单次或周期任务，并保存任务内容及当前用户、会话上下文 |
+| `query_agent_tasks` | 查询任务配置、启用状态、下次执行时间及最近执行结果 |
+| `update_agent_task` | 修改任务内容或触发器，也可通过 `enabled` 暂停、恢复任务 |
+| `run_agent_task` | 使用整数 `task_id` 将当前用户已启用的任务提交为立即执行 |
+| `delete_agent_task` | 永久删除任务并立即移除运行时调度 |
+
+`trigger_type=date` 表示单次执行：“30 分钟后检查”这类相对时间传 `delay_minutes=30`，由后端计算精确时间；固定时间则传 ISO 8601 `trigger`，支持精确到秒。`trigger_type=cron` 使用标准五段 cron（分、时、日、月、周），适合周期检查。未显式携带时区的时间按 MoviePilot 的 `TZ` 配置解释。任务由内存调度器精确触发，配置持久化到数据库，服务重启后会自动恢复；触发后 Agent 在原会话中执行 `content`，执行过程及最终结果均不绑定创建任务时的消息渠道，而是通过 MoviePilot 已配置的通知渠道广播。如果 Agent 在执行过程中已通过消息工具发送完整结果，任务结束时不会再次发送相同的最终回复。
+
+Agent 自主任务工具使用数据库中的整数 `task_id`。`query_schedulers` 与 `run_scheduler` 仅面向系统、插件和工作流注册的运行时定时服务，使用字符串 `job_id`，不会返回或执行 `agent-task-*`。两类 ID 不可混用；需要立即执行自主任务时，应先通过 `query_agent_tasks` 确认归属和状态，再调用 `run_agent_task`。立即执行只提交任务，不在当前工具调用内等待结果，从而避免同一 Agent 会话互相等待；执行结果仍按上述通知规则广播。
+
+上述过滤只约束 Agent 工具，避免模型混用两类任务。前端系统设置和仪表盘使用的 `/api/v1/dashboard/schedule` 仍返回完整运行时列表，其中包含 `provider=[Agent]` 的自主任务；前端通过 `/api/v1/system/runscheduler` 立即执行这类列表项的行为也保持不变。
+
+创建单次任务的参数示例：
+
+```json
+{
+  "tool_name": "create_agent_task",
+  "arguments": {
+    "name": "检查电影资源",
+    "content": "搜索电影《示例电影》是否已有可下载资源，并报告站点、版本和大小；不要自动下载。",
+    "trigger_type": "date",
+    "delay_minutes": 30
+  }
+}
+```
+
+创建每天 20:30 执行的周期任务时，使用 `trigger_type=cron` 和 `trigger="30 20 * * *"`。
 
 **认证**: 需要API KEY，在请求头中添加 `X-API-KEY: <api_key>` 或在查询参数中添加 `apikey=<api_key>`
 
@@ -198,6 +275,10 @@ FastAPI 异常响应保留 `detail` 字段，并在错误详情为文本时返�
   ...
 ]
 ```
+
+#### 系统诊断工具
+
+`query_doctor_report` 以只读方式返回 MoviePilot Doctor 诊断报告，可通过 `deep` 启用深度检查，并通过 `include_details` 控制是否返回完整详情。每条诊断项的 `affects_report_status` 表示其是否参与整体状态聚合；插件日志异常会保留为 `warn/degraded` 线索，但该字段为 `false`，不会单独把系统整体状态降为 `degraded`。
 
 ### 2. 调用工具
 

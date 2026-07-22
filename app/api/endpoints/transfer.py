@@ -269,8 +269,9 @@ def manual_transfer(
             )
         # 强制转移
         force = True
-        downloader = history.downloader
-        download_hash = history.download_hash
+        # 下载器与 Hash 是同一组下载上下文，重新识别时由当前文件路径重新匹配。
+        downloader = history.downloader if transer_item.from_history else None
+        download_hash = history.download_hash if transer_item.from_history else None
         if history.status and ("move" in history.mode):
             # 重新整理成功的转移，则使用成功的 dest 做 in_path
             src_fileitems = [FileItem(**history.dest_fileitem)]
@@ -290,6 +291,14 @@ def manual_transfer(
             )
             transer_item.doubanid = (
                 str(history.doubanid) if history.doubanid else transer_item.doubanid
+            )
+            transer_item.bangumiid = history.bangumiid or transer_item.bangumiid
+            transer_item.anilistid = history.anilistid or transer_item.anilistid
+            transer_item.media_source = (
+                history.media_source or transer_item.media_source
+            )
+            transer_item.media_id = (
+                history.media_id or transer_item.media_id
             )
             transer_item.season = (
                 int(str(history.seasons).replace("S", ""))
@@ -408,6 +417,10 @@ def manual_transfer(
                 target_path=target_path,
                 tmdbid=transer_item.tmdbid,
                 doubanid=transer_item.doubanid,
+                bangumiid=transer_item.bangumiid,
+                anilistid=transer_item.anilistid,
+                media_source=transer_item.media_source,
+                media_id=transer_item.media_id,
                 mtype=mtype,
                 season=transer_item.season,
                 episode_group=transer_item.episode_group,
@@ -490,6 +503,10 @@ def manual_transfer(
         target_path=target_path,
         tmdbid=transer_item.tmdbid,
         doubanid=transer_item.doubanid,
+        bangumiid=transer_item.bangumiid,
+        anilistid=transer_item.anilistid,
+        media_source=transer_item.media_source,
+        media_id=transer_item.media_id,
         mtype=mtype,
         season=transer_item.season,
         episode_group=transer_item.episode_group,

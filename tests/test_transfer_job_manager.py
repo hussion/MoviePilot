@@ -56,15 +56,21 @@ class FakeMeta:
 
 class FakeMedia:
     def __init__(self, tmdb_id: int = 12345):
+        """构造与正式 MediaInfo 身份字段一致的测试媒体对象。"""
         self.tmdb_id = tmdb_id
         self.douban_id = None
+        self.bangumi_id = None
+        self.anilist_id = None
+        self.source = "themoviedb"
         self.type = MediaType.TV
         self.title_year = "Test Show (2026)"
 
     def clear(self):
+        """模拟正式媒体对象的清理接口。"""
         pass
 
     def to_dict(self):
+        """返回测试媒体对象的序列化字段。"""
         return {
             "type": MediaType.TV.value,
             "title": "Test Show",
@@ -72,6 +78,8 @@ class FakeMedia:
             "title_year": "Test Show (2026)",
             "tmdb_id": self.tmdb_id,
             "douban_id": self.douban_id,
+            "bangumi_id": self.bangumi_id,
+            "anilist_id": self.anilist_id,
         }
 
 
@@ -579,6 +587,7 @@ class TransferJobManagerTest(unittest.TestCase):
             completed.append((hashs, downloader))
 
         chain.transfer_completed = fake_transfer_completed
+        chain.list_torrents = lambda **kwargs: [SimpleNamespace(progress=100)]
         chain._TransferChain__get_trans_fileitems = lambda fileitem, predicate: [
             (fileitem, False)
         ]
@@ -621,6 +630,7 @@ class TransferJobManagerTest(unittest.TestCase):
             completed.append((hashs, downloader))
 
         chain.transfer_completed = fake_transfer_completed
+        chain.list_torrents = lambda **kwargs: [SimpleNamespace(progress=100)]
         chain._TransferChain__get_trans_fileitems = lambda fileitem, predicate: [
             (fileitem, False)
         ]
@@ -664,6 +674,7 @@ class TransferJobManagerTest(unittest.TestCase):
             completed.append((hashs, downloader))
 
         chain.transfer_completed = fake_transfer_completed
+        chain.list_torrents = lambda **kwargs: [SimpleNamespace(progress=100)]
         task = make_task(1)
         task.downloader = "qbittorrent"
         task.download_hash = "abc123"
